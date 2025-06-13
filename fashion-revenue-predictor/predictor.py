@@ -1,4 +1,4 @@
-import pickle
+import joblib
 import json
 import numpy as np
 import pandas as pd
@@ -20,8 +20,7 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
         - Top 5 most important features
     """
     # Load models and features
-    with open('models/brandA_models.pkl', 'rb') as f:
-        models = pickle.load(f)
+    models = joblib.load('models/brandA_models.pkl')
     with open('models/brandA_features.json', 'r') as f:
         required_features = json.load(f)
     

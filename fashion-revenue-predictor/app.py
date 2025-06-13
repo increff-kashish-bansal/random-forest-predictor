@@ -231,7 +231,16 @@ elif page == "Predict":
         store_id = st.selectbox("Select Store", options=st.session_state.processed_stores['id'].unique())
         future_date = st.date_input("Select Future Date", min_value=datetime.now().date())
         store_area = st.number_input("Store Area (sq ft)", min_value=0.0, value=float(st.session_state.processed_stores[st.session_state.processed_stores['id'] == store_id]['store_area'].iloc[0]))
-        discount_pct = st.slider("Discount Percentage", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
+        
+        # Update discount slider to handle percentages
+        discount_pct = st.slider(
+            "Discount Percentage",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=1.0,
+            format="%.1f%%"
+        ) / 100.0  # Convert percentage to decimal
         
         if st.button("Predict"):
             try:
@@ -241,7 +250,7 @@ elif page == "Predict":
                     'date': [pd.Timestamp(future_date)],
                     'qty_sold': [0],
                     'revenue': [0],
-                    'disc_perc': [discount_pct]
+                    'disc_perc': [discount_pct]  # Already in decimal form
                 })
                 
                 # Get matching store row
