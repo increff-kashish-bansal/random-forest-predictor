@@ -1,19 +1,34 @@
-# Python virtual environment
-.venv/
-venv/
-ENV/
-
-# Python cache files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Log files
-*.log
+# Generated files
+*.npy
+*.png
 
-# IDE files
+# Environment
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# IDE
 .idea/
 .vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# DevContainer
+.devcontainer/
+
+# Logs
+*.log
 
 # Model files
 models/*.pkl

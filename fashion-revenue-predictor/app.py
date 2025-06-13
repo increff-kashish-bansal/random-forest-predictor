@@ -491,7 +491,7 @@ elif page == "Predict":
                         X_pred[feat] = 0
                 X_pred = X_pred.reindex(columns=required_features, fill_value=0)
                 # Make prediction
-                results = predict_and_explain(X_pred, historical_sales=historical_sales)
+                results = predict_and_explain(X_pred, historical_sales=historical_sales, original_input=synthetic_sales)
                 
                 # Display results
                 st.markdown("---")

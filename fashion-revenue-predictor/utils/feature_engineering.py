@@ -1001,4 +1001,45 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         if col in df.columns and col not in features:
             features.append(col)
     
+    # --- Same-day-of-year anchors (prediction only, if historical_sales is provided) ---
+    if is_prediction and historical_sales is not None:
+        def get_same_dayofyear_avg(row):
+            store = row['store']
+            dayofyear = row['date'].timetuple().tm_yday
+            years = row['date'].year
+            # Find same store, same day-of-year, in past 3 years
+            mask = (
+                (historical_sales['store'] == store) &
+                (historical_sales['date'].dt.dayofyear == dayofyear) &
+                (historical_sales['date'].dt.year < years) &
+                (historical_sales['date'].dt.year >= years - 3)
+            )
+            return historical_sales[mask]['revenue'].mean() if not historical_sales[mask].empty else np.nan
+        def get_month_avg(row):
+            store = row['store']
+            month = row['date'].month
+            mask = (
+                (historical_sales['store'] == store) &
+                (historical_sales['date'].dt.month == month)
+            )
+            return historical_sales[mask]['revenue'].mean() if not historical_sales[mask].empty else np.nan
+        df['same_dayofyear_avg_3y'] = df.apply(get_same_dayofyear_avg, axis=1)
+        df['same_dayofyear_month_avg'] = df.apply(get_month_avg, axis=1)
+        df['same_dayofyear_delta_vs_month'] = df['same_dayofyear_avg_3y'] - df['same_dayofyear_month_avg']
+        features.extend(['same_dayofyear_avg_3y', 'same_dayofyear_delta_vs_month'])
+
+    # --- Discount and revenue 14-day memory (prediction and training) ---
+    if historical_sales is not None and is_prediction:
+        def get_rolling_mean(row, col, window):
+            store = row['store']
+            date = row['date']
+            mask = (
+                (historical_sales['store'] == store) &
+                (historical_sales['date'] < date)
+            )
+            return historical_sales[mask].sort_values('date')[col].tail(window).mean() if not historical_sales[mask].empty else np.nan
+        df['discount_rolling_mean_14d'] = df.apply(lambda row: get_rolling_mean(row, 'discount_pct', 14), axis=1)
+        df['revenue_rolling_mean_14d'] = df.apply(lambda row: get_rolling_mean(row, 'revenue', 14), axis=1)
+        features.extend(['discount_rolling_mean_14d', 'revenue_rolling_mean_14d'])
+    
     return X, features

@@ -23,7 +23,7 @@ The sales data should include the following columns:
 
 The application automatically calculates the discount percentage (`disc_perc`) as:
 ```
-disc_perc = disc_value / (revenue + disc_value)
+disc_perc = disc_value * 100 / (revenue + disc_value)
 ```
 
 ### Stores Data Template

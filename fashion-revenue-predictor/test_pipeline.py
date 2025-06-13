@@ -149,7 +149,7 @@ def test_prediction(df_sales, df_stores):
         X_pred, _ = derive_features(synthetic_sales, synthetic_stores, historical_sales=historical_sales, is_prediction=True)
         
         # Make prediction
-        results = predict_and_explain(X_pred)
+        results = predict_and_explain(X_pred, historical_sales=historical_sales, original_input=synthetic_sales)
         
         logging.info("Prediction completed successfully")
         logging.info(f"Predicted revenue: ${results['p50'][0]:,.2f}")
