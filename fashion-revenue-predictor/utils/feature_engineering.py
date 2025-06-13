@@ -21,6 +21,40 @@ logging.basicConfig(
     ]
 )
 
+def calculate_sample_weights(df: pd.DataFrame, revenue_col: str = 'revenue', time_col: str = 'date') -> np.ndarray:
+    """
+    Calculate fine-tuned sample weights that combine time decay and capped log-based weights.
+    
+    Args:
+        df: DataFrame containing the data
+        revenue_col: Name of the revenue column
+        time_col: Name of the date column
+        
+    Returns:
+        Array of sample weights
+    """
+    # Calculate time decay weights (more recent samples get higher weights)
+    max_date = df[time_col].max()
+    days_diff = (max_date - df[time_col]).dt.days
+    time_decay_weights = 1 / (1 + np.log1p(days_diff))
+    
+    # Calculate capped log-based weights for revenue
+    revenue_values = df[revenue_col].values
+    revenue_cap = np.percentile(revenue_values, 95)  # Cap at 95th percentile
+    log_weights = np.log1p(np.minimum(revenue_values, revenue_cap))
+    
+    # Normalize both weight components
+    time_decay_weights = time_decay_weights / np.mean(time_decay_weights)
+    log_weights = log_weights / np.mean(log_weights)
+    
+    # Combine weights with 60% time decay and 40% revenue importance
+    combined_weights = 0.6 * time_decay_weights + 0.4 * log_weights
+    
+    # Normalize final weights to have mean of 1
+    combined_weights = combined_weights / np.mean(combined_weights)
+    
+    return combined_weights
+
 def apply_cluster_specific_transforms(df: pd.DataFrame, cluster: str) -> pd.DataFrame:
     """
     Apply cluster-specific feature transformations.
@@ -107,6 +141,13 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     logging.info(f"Input shapes - Sales: {df_sales.shape}, Stores: {df_stores.shape}")
     if historical_sales is not None:
         logging.info(f"Historical sales shape: {historical_sales.shape}")
+    
+    # Calculate sample weights if not in prediction mode
+    if not is_prediction and 'revenue' in df_sales.columns:
+        sample_weights = calculate_sample_weights(df_sales)
+        # Save weights for later use in model training
+        np.save('models/sample_weights.npy', sample_weights)
+        logging.info("Sample weights calculated and saved")
     
     # Ensure consistent data types for categorical columns
     categorical_cols = ['channel', 'region', 'city']
