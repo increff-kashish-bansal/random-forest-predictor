@@ -245,9 +245,18 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             })
         ).reset_index()
         
+        # Calculate seasonal index for each store
+        store_seasonal_index = df.groupby(['store', 'month']).apply(
+            lambda x: pd.DataFrame({
+                'date': x['date'],
+                'seasonal_index': x['revenue'].expanding().median() / x.groupby('store')['revenue'].transform('median')
+            })
+        ).reset_index()
+        
         # Save store stats for prediction
         store_stats.to_json('models/store_stats.json')
         store_month_stats.to_json('models/store_month_stats.json')
+        store_seasonal_index.to_json('models/store_seasonal_index.json')
         
         # Add store stats to features
         store_stats_features = ['revenue_median', 'revenue_std',
@@ -259,6 +268,12 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         # Merge store stats
         df = df.merge(store_stats, on=['store', 'date'], how='left')
         df = df.merge(store_month_stats, on=['store', 'month', 'date'], how='left')
+        df = df.merge(store_seasonal_index, on=['store', 'month', 'date'], how='left')
+        
+        # Add store-seasonality interaction features
+        df['store_seasonal_index'] = df['seasonal_index'] * df['store_area_bucket']
+        df['region_seasonal_index'] = df['seasonal_index'] * df['region_encoded']
+        features.extend(['store_seasonal_index', 'region_seasonal_index'])
         
         # Add lag features (using only past data)
         for lag in [1, 3, 7, 14, 30]:
@@ -282,12 +297,15 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         try:
             store_stats = pd.read_json('models/store_stats.json')
             store_month_stats = pd.read_json('models/store_month_stats.json')
+            store_seasonal_index = pd.read_json('models/store_seasonal_index.json')
             
             # Ensure store IDs are strings and convert dates
             store_stats['store'] = store_stats['store'].astype(str)
             store_stats['date'] = pd.to_datetime(store_stats['date'])
             store_month_stats['store'] = store_month_stats['store'].astype(str)
             store_month_stats['date'] = pd.to_datetime(store_month_stats['date'])
+            store_seasonal_index['store'] = store_seasonal_index['store'].astype(str)
+            store_seasonal_index['date'] = pd.to_datetime(store_seasonal_index['date'])
             
             # Add store stats to features
             store_stats_features = ['revenue_median', 'revenue_std',
@@ -299,6 +317,12 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             # Merge store stats
             df = df.merge(store_stats, on=['store', 'date'], how='left')
             df = df.merge(store_month_stats, on=['store', 'month', 'date'], how='left')
+            df = df.merge(store_seasonal_index, on=['store', 'month', 'date'], how='left')
+            
+            # Add store-seasonality interaction features
+            df['store_seasonal_index'] = df['seasonal_index'] * df['store_area_bucket']
+            df['region_seasonal_index'] = df['seasonal_index'] * df['region_encoded']
+            features.extend(['store_seasonal_index', 'region_seasonal_index'])
             
             # Add lag features from historical data
             if historical_sales is not None:
@@ -343,6 +367,12 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
                 df[f'revenue_rolling_mean_{window}d'] = 0
                 df[f'revenue_rolling_std_{window}d'] = 0
                 features.extend([f'revenue_rolling_mean_{window}d', f'revenue_rolling_std_{window}d'])
+            
+            # Add empty seasonal features
+            df['seasonal_index'] = 1.0  # Default to neutral seasonal effect
+            df['store_seasonal_index'] = df['store_area_bucket']
+            df['region_seasonal_index'] = df['region_encoded']
+            features.extend(['store_seasonal_index', 'region_seasonal_index'])
     
     # Fill NaN values in historical features with 0
     historical_features = [f for f in features if any(x in f for x in ['mean', 'std', 'median', 'lag', 'rolling'])]
