@@ -1,11 +1,13 @@
 import pandas as pd
 import numpy as np
-from typing import Tuple
+from typing import Tuple, List
 from sklearn.preprocessing import LabelEncoder
 from sklearn.cluster import KMeans
 import json
 import logging
 from pathlib import Path
+import os
+from datetime import datetime, timedelta
 
 # Configure logging
 logging.basicConfig(
@@ -17,7 +19,7 @@ logging.basicConfig(
     ]
 )
 
-def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_prediction: bool = False) -> Tuple[pd.DataFrame, pd.Series]:
+def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_prediction: bool = False) -> Tuple[pd.DataFrame, List[str]]:
     """
     Derive features from sales and stores data.
     
@@ -29,6 +31,9 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_predicti
     Returns:
         Tuple of (X: feature matrix, y: target variable)
     """
+    # Create models directory if it doesn't exist
+    os.makedirs('models', exist_ok=True)
+    
     logging.info("Starting feature engineering...")
     logging.info(f"Input shapes - Sales: {df_sales.shape}, Stores: {df_stores.shape}")
     
