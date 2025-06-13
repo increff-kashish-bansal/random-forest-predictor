@@ -289,6 +289,13 @@ def train_model(df_sales, df_stores):
         median_model.fit(X[selected_features], y_log, sample_weight=sample_weights)
         models['median'] = median_model
         
+        # Get median predictions for residual calculation
+        median_preds = np.expm1(median_model.predict(X[selected_features]))
+        
+        # Calculate residuals for lower and upper quantile models
+        lower_targets = np.clip(median_preds - y, 0, None)  # Positive residuals for lower bound
+        upper_targets = np.clip(y - median_preds, 0, None)  # Positive residuals for upper bound
+        
         # Get feature importances from median model
         importances = dict(zip(selected_features, median_model.feature_importances_))
         sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
@@ -297,13 +304,13 @@ def train_model(df_sales, df_stores):
         X_lower, lower_features = select_features_by_importance(X[selected_features], sorted_importances, 'lower')
         X_upper, upper_features = select_features_by_importance(X[selected_features], sorted_importances, 'upper')
         
-        # 2. Train lower tail model
-        logging.info("\nTraining lower tail model...")
+        # 2. Train lower tail model on residuals
+        logging.info("\nTraining lower tail model on residuals...")
         lower_model = RandomForestRegressor(**model_params)
         
         for train_idx, test_idx in gtscv.split(X_lower, groups=store_ids):
             X_train, X_test = X_lower.iloc[train_idx], X_lower.iloc[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
+            y_train, y_test = lower_targets[train_idx], lower_targets[test_idx]
             weights_train = sample_weights[train_idx]
             
             lower_model.fit(X_train, y_train, sample_weight=weights_train)
@@ -311,16 +318,16 @@ def train_model(df_sales, df_stores):
             score = np.corrcoef(y_test, y_pred)[0,1]**2
             cv_scores['lower'].append(score)
         
-        lower_model.fit(X_lower, y, sample_weight=sample_weights)
+        lower_model.fit(X_lower, lower_targets, sample_weight=sample_weights)
         models['lower'] = lower_model
         
-        # 3. Train upper tail model
-        logging.info("\nTraining upper tail model...")
+        # 3. Train upper tail model on residuals
+        logging.info("\nTraining upper tail model on residuals...")
         upper_model = RandomForestRegressor(**model_params)
         
         for train_idx, test_idx in gtscv.split(X_upper, groups=store_ids):
             X_train, X_test = X_upper.iloc[train_idx], X_upper.iloc[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
+            y_train, y_test = upper_targets[train_idx], upper_targets[test_idx]
             weights_train = sample_weights[train_idx]
             
             upper_model.fit(X_train, y_train, sample_weight=weights_train)
@@ -328,7 +335,7 @@ def train_model(df_sales, df_stores):
             score = np.corrcoef(y_test, y_pred)[0,1]**2
             cv_scores['upper'].append(score)
         
-        upper_model.fit(X_upper, y, sample_weight=sample_weights)
+        upper_model.fit(X_upper, upper_targets, sample_weight=sample_weights)
         models['upper'] = upper_model
         
         # Calculate prediction interval metrics
@@ -337,9 +344,13 @@ def train_model(df_sales, df_stores):
             y_train, y_test = y[train_idx], y[test_idx]
             
             # Get predictions for this fold
-            p10 = lower_model.predict(X_test[lower_features])
             p50 = np.expm1(median_model.predict(X_test[selected_features]))
-            p90 = upper_model.predict(X_test[upper_features])
+            lower_residuals = lower_model.predict(X_test[lower_features])
+            upper_residuals = upper_model.predict(X_test[upper_features])
+            
+            # Calculate final predictions
+            p10 = p50 - lower_residuals
+            p90 = p50 + upper_residuals
             
             # Calculate metrics
             fold_metrics = calculate_prediction_metrics(y_test, p10, p50, p90)

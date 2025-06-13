@@ -41,16 +41,16 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     # 1. Median predictions (log scale)
     median_pred = np.expm1(models['median'].predict(df_X[feature_names['all_features']]))
     
-    # 2. Lower tail predictions (untransformed)
-    lower_pred = models['lower'].predict(df_X[feature_names['lower_features']])
+    # 2. Lower tail predictions (residuals)
+    lower_residuals = models['lower'].predict(df_X[feature_names['lower_features']])
     
-    # 3. Upper tail predictions (untransformed)
-    upper_pred = models['upper'].predict(df_X[feature_names['upper_features']])
+    # 3. Upper tail predictions (residuals)
+    upper_residuals = models['upper'].predict(df_X[feature_names['upper_features']])
     
     # Calculate prediction intervals
-    p10 = lower_pred
+    p10 = median_pred - lower_residuals
     p50 = median_pred
-    p90 = upper_pred
+    p90 = median_pred + upper_residuals
     
     # Calculate SHAP values using median model
     explainer = shap.TreeExplainer(models['median'])
