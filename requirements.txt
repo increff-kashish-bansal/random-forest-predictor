@@ -1,9 +1,7 @@
 streamlit
 pandas
+numpy
 scikit-learn
-xgboost
-lightgbm
-prophet
-statsmodels
-pmdarima
-gluonts
+shap
+matplotlib
+scipy 
