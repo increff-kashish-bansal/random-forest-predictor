@@ -5,4 +5,5 @@ scikit-learn
 shap
 matplotlib
 scipy
-lightgbm 
+lightgbm
+statsmodels>=0.14.0 

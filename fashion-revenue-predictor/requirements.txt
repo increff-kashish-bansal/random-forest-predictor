@@ -10,3 +10,4 @@ joblib>=1.3.0   # For model persistence
 python-dotenv>=1.0.0  # For environment variable management
 lightgbm>=4.0.0
 optuna>=3.0.0
+statsmodels>=0.14.0  # For variance inflation factor calculation
