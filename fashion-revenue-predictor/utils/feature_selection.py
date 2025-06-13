@@ -285,118 +285,132 @@ def get_common_features(
     logging.info(f"Found {len(common_features)} common features across clusters")
     return common_features
 
-def iterative_feature_pruning(
-    X: pd.DataFrame,
-    y: pd.Series,
-    model_params: Dict,
-    n_iter: int = 10
-) -> Tuple[BaseEstimator, List[str], List[float]]:
+def remove_correlated_features(X: pd.DataFrame, threshold: float = 0.95) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Iteratively prune features based on importance scores to improve model performance.
+    Remove highly correlated features to reduce redundancy.
     
     Args:
         X: Feature DataFrame
-        y: Target Series
-        model_params: Dictionary of model parameters for RandomForestRegressor
-        n_iter: Maximum number of iterations
+        threshold: Correlation threshold (features with correlation above this will be considered redundant)
         
     Returns:
-        Tuple of (best model, final selected features, R² scores progression)
+        Tuple of (filtered DataFrame, list of removed feature names)
     """
+    logging.info(f"Starting correlation analysis with threshold {threshold}...")
+    
+    # Calculate correlation matrix
+    corr_matrix = X.corr().abs()
+    
+    # Get upper triangle of correlation matrix
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    
+    # Find features with correlation above threshold
+    to_drop = []
+    for column in upper.columns:
+        if any(upper[column] > threshold):
+            # Find the feature with the highest correlation
+            correlated_features = upper[column][upper[column] > threshold].index.tolist()
+            if correlated_features:
+                # Keep the feature with the highest variance
+                variances = X[correlated_features + [column]].var()
+                feature_to_keep = variances.idxmax()
+                features_to_drop = [f for f in correlated_features + [column] if f != feature_to_keep]
+                to_drop.extend(features_to_drop)
+    
+    # Remove duplicates while preserving order
+    to_drop = list(dict.fromkeys(to_drop))
+    
+    if to_drop:
+        logging.info(f"Removing {len(to_drop)} highly correlated features")
+        logging.info(f"Removed features: {to_drop}")
+        
+        # Create correlation report for removed features
+        corr_report = []
+        for feature in to_drop:
+            # Find the feature it was most correlated with
+            correlations = corr_matrix[feature].sort_values(ascending=False)
+            most_correlated = correlations.index[1]  # Skip self-correlation
+            corr_value = correlations.iloc[1]
+            corr_report.append(f"{feature} (corr={corr_value:.3f} with {most_correlated})")
+        
+        logging.info("Correlation report for removed features:")
+        for report in corr_report:
+            logging.info(f"- {report}")
+    
+    # Return the original DataFrame with the same columns as X_clean
+    return X.drop(columns=to_drop), to_drop
+
+def iterative_feature_pruning(X: pd.DataFrame, y: np.ndarray, model_params: Dict, n_iter: int = 5) -> Tuple[RandomForestRegressor, List[str], List[float]]:
+    """
+    Iteratively prune features based on importance and correlation.
+    
+    Args:
+        X: Feature matrix
+        y: Target values
+        model_params: Parameters for RandomForestRegressor
+        n_iter: Number of pruning iterations
+        
+    Returns:
+        Tuple of (best model, selected features, R² scores)
+    """
+    logging.info("Starting iterative feature pruning...")
+    
     # Initialize variables
-    current_features = list(X.columns)
+    current_features = X.columns.tolist()
+    r2_scores = []
     best_r2 = -np.inf
     best_model = None
     best_features = None
-    r2_scores = []
-    dropped_features_history = []
-    no_improvement_count = 0
     
-    # Create time series split for validation
-    tscv = TimeSeriesSplit(n_splits=5)
-    
-    # Create models directory if it doesn't exist
-    Path('models').mkdir(exist_ok=True)
-    
-    logging.info(f"Starting iterative feature pruning with {len(current_features)} initial features")
-    
-    for iteration in range(n_iter):
-        logging.info(f"\nIteration {iteration + 1}/{n_iter}")
+    for i in range(n_iter):
+        logging.info(f"\nIteration {i+1}/{n_iter}")
+        logging.info(f"Current feature count: {len(current_features)}")
         
-        # Train model with current features
+        # 1. Remove highly correlated features
+        X_uncorr, removed_corr = remove_correlated_features(X[current_features], threshold=0.95)
+        current_features = X_uncorr.columns.tolist()
+        logging.info(f"Features after correlation pruning: {len(current_features)}")
+        
+        # 2. Remove features with high VIF
+        X_low_vif, removed_vif = remove_high_vif(X_uncorr, threshold=5.0)
+        current_features = X_low_vif.columns.tolist()
+        logging.info(f"Features after VIF pruning: {len(current_features)}")
+        
+        # 3. Train model and get feature importance
         model = RandomForestRegressor(**model_params)
+        model.fit(X_low_vif, y)
         
-        # Cross-validation scores
-        cv_scores = []
+        # Calculate R² score
+        r2 = model.score(X_low_vif, y)
+        r2_scores.append(r2)
+        logging.info(f"R² score: {r2:.4f}")
         
-        # Perform time series cross-validation
-        for train_idx, val_idx in tscv.split(X[current_features]):
-            X_train, X_val = X[current_features].iloc[train_idx], X[current_features].iloc[val_idx]
-            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_val)
-            r2 = np.corrcoef(y_val, y_pred)[0,1]**2
-            cv_scores.append(r2)
-        
-        # Calculate mean R² score
-        mean_r2 = np.mean(cv_scores)
-        r2_scores.append(mean_r2)
-        
-        logging.info(f"Current R² score: {mean_r2:.4f}")
-        
-        # Check if this is the best model so far
-        if mean_r2 > best_r2:
-            best_r2 = mean_r2
+        # Update best model if current is better
+        if r2 > best_r2:
+            best_r2 = r2
             best_model = model
             best_features = current_features.copy()
-            no_improvement_count = 0
-            
-            # Save best model
-            joblib.dump(best_model, 'models/best_pruned_model.pkl')
-            logging.info(f"New best model saved with R²: {best_r2:.4f}")
-        else:
-            no_improvement_count += 1
-            logging.info(f"No improvement for {no_improvement_count} iterations")
+            logging.info("New best model found!")
         
-        # Early stopping if no improvement for 3 rounds
-        if no_improvement_count >= 3:
-            logging.info("Early stopping: No improvement for 3 consecutive rounds")
+        # 4. Remove least important features
+        importances = pd.Series(model.feature_importances_, index=current_features)
+        importances = importances.sort_values(ascending=False)
+        
+        # Remove bottom 10% of features
+        n_to_remove = max(1, int(len(current_features) * 0.1))
+        removed_features = importances.tail(n_to_remove).index.tolist()
+        current_features = importances.head(len(current_features) - n_to_remove).index.tolist()
+        
+        logging.info(f"Removed {n_to_remove} least important features")
+        logging.info(f"Remaining features: {len(current_features)}")
+        
+        # Stop if we've removed too many features
+        if len(current_features) < 10:
+            logging.info("Stopping early due to too few features remaining")
             break
-        
-        # Get feature importances
-        importances = dict(zip(current_features, model.feature_importances_))
-        sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1]))
-        
-        # Calculate number of features to drop (5% or minimum 3)
-        n_to_drop = max(3, int(len(current_features) * 0.05))
-        
-        # Get features to drop with their importances
-        features_to_drop = list(sorted_importances.items())[:n_to_drop]
-        dropped_features_history.append({
-            'iteration': iteration + 1,
-            'features': dict(features_to_drop)
-        })
-        
-        # Update current features
-        current_features = [f for f in current_features if f not in dict(features_to_drop)]
-        
-        logging.info(f"Dropped {len(features_to_drop)} features")
-        logging.info("Dropped features and their importances:")
-        for feat, imp in features_to_drop:
-            logging.info(f"{feat}: {imp:.4f}")
     
-    # Log final results
-    logging.info("\nFeature pruning completed")
+    logging.info("\nFeature pruning complete")
+    logging.info(f"Final feature count: {len(best_features)}")
     logging.info(f"Best R² score: {best_r2:.4f}")
-    logging.info(f"Final number of features: {len(best_features)}")
-    
-    # Save pruning history
-    with open('models/feature_pruning_history.json', 'w') as f:
-        json.dump({
-            'r2_scores': r2_scores,
-            'dropped_features': dropped_features_history,
-            'final_features': best_features
-        }, f, indent=2)
     
     return best_model, best_features, r2_scores 

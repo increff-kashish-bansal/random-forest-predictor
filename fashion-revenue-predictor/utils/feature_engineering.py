@@ -173,21 +173,45 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             'region': sorted(df['region'].unique().tolist()),
             'city': sorted(df['city'].unique().tolist())
         }
-        # Save categories for prediction
+        
+        # Calculate frequency encodings for cities and regions
+        city_freq = df['city'].value_counts(normalize=True)
+        region_freq = df['region'].value_counts(normalize=True)
+        
+        # Save categories and frequencies for prediction
         with open('models/categories.json', 'w') as f:
             json.dump(all_categories, f)
+        with open('models/city_frequencies.json', 'w') as f:
+            json.dump(city_freq.to_dict(), f)
+        with open('models/region_frequencies.json', 'w') as f:
+            json.dump(region_freq.to_dict(), f)
     else:
-        # During prediction, load categories from training
+        # During prediction, load categories and frequencies
         try:
             with open('models/categories.json', 'r') as f:
                 all_categories = json.load(f)
+            with open('models/city_frequencies.json', 'r') as f:
+                city_freq = pd.Series(json.load(f))
+            with open('models/region_frequencies.json', 'r') as f:
+                region_freq = pd.Series(json.load(f))
         except FileNotFoundError:
-            raise ValueError("Categories file not found. Please train the model first.")
+            raise ValueError("Categories or frequency files not found. Please train the model first.")
     
-    # One-hot encode categorical features
+    # Apply frequency encoding for cities and regions
+    df['city_frequency'] = df['city'].map(city_freq).fillna(0)
+    df['region_frequency'] = df['region'].map(region_freq).fillna(0)
+    features.extend(['city_frequency', 'region_frequency'])
+    
+    # One-hot encode categorical features with sparsity filtering
     for col, possible_values in all_categories.items():
-        # Create dummy variables for all possible values
-        for value in possible_values:
+        # Calculate frequency of each category
+        category_freq = df[col].value_counts(normalize=True)
+        
+        # Filter out categories that appear in less than 1% of data
+        valid_categories = category_freq[category_freq >= 0.01].index.tolist()
+        
+        # Create dummy variables only for valid categories
+        for value in valid_categories:
             col_name = f"{col}_{value}"
             df[col_name] = (df[col] == value).astype(int)
             features.append(col_name)
@@ -203,32 +227,203 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     df['discount_pct'] = df['discount_pct'].clip(0, 1)
     df['is_discounted'] = (df['discount_pct'] > 0).astype(int)
     
+    # 4. Historical Features
+    logging.info("Generating historical features...")
+    if not is_prediction:
+        # During training, calculate store-level statistics using only past data
+        df = df.sort_values(['store', 'date'])
+        
+        # Calculate expanding statistics (using only past data)
+        store_stats = df.groupby('store').apply(
+            lambda x: pd.DataFrame({
+                'date': x['date'],  # Include date in the output
+                'revenue_median': x['revenue'].expanding().median(),  # Keep median instead of mean
+                'revenue_std': x['revenue'].expanding().std(),
+                'qty_sold_median': x['qty_sold'].expanding().median(),  # Keep median instead of mean
+                'qty_sold_std': x['qty_sold'].expanding().std()
+            })
+        ).reset_index()
+        
+        # Calculate store-month seasonal indices using only past data
+        store_month_stats = df.groupby(['store', 'month']).apply(
+            lambda x: pd.DataFrame({
+                'date': x['date'],  # Include date in the output
+                'store_month_revenue_median': x['revenue'].expanding().median(),  # Use median instead of mean
+                'store_month_revenue_std': x['revenue'].expanding().std()
+            })
+        ).reset_index()
+        
+        # Save store stats for prediction
+        store_stats.to_json('models/store_stats.json')
+        store_month_stats.to_json('models/store_month_stats.json')
+        
+        # Add store stats to features
+        store_stats_features = ['revenue_median', 'revenue_std',
+                              'qty_sold_median', 'qty_sold_std']
+        store_month_features = ['store_month_revenue_median', 'store_month_revenue_std']
+        features.extend(store_stats_features)
+        features.extend(store_month_features)
+        
+        # Merge store stats
+        df = df.merge(store_stats, on=['store', 'date'], how='left')
+        df = df.merge(store_month_stats, on=['store', 'month', 'date'], how='left')
+        
+        # Add lag features (using only past data)
+        for lag in [1, 3, 7, 14, 30]:
+            df[f'revenue_lag_{lag}'] = df.groupby('store')['revenue'].shift(lag)
+            df[f'qty_sold_lag_{lag}'] = df.groupby('store')['qty_sold'].shift(lag)
+            features.extend([f'revenue_lag_{lag}', f'qty_sold_lag_{lag}'])
+        
+        # Add rolling statistics (using only past data)
+        for window in [7, 14, 30]:
+            # Use consistent naming for rolling statistics
+            df[f'revenue_rolling_mean_{window}d'] = df.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(window=window, min_periods=1).mean().shift(1)
+            )
+            df[f'revenue_rolling_std_{window}d'] = df.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(window=window, min_periods=1).std().shift(1)
+            )
+            features.extend([f'revenue_rolling_mean_{window}d', f'revenue_rolling_std_{window}d'])
+        
+    else:
+        # During prediction, load store stats
+        try:
+            store_stats = pd.read_json('models/store_stats.json')
+            store_month_stats = pd.read_json('models/store_month_stats.json')
+            
+            # Ensure store IDs are strings and convert dates
+            store_stats['store'] = store_stats['store'].astype(str)
+            store_stats['date'] = pd.to_datetime(store_stats['date'])
+            store_month_stats['store'] = store_month_stats['store'].astype(str)
+            store_month_stats['date'] = pd.to_datetime(store_month_stats['date'])
+            
+            # Add store stats to features
+            store_stats_features = ['revenue_median', 'revenue_std',
+                                  'qty_sold_median', 'qty_sold_std']
+            store_month_features = ['store_month_revenue_median', 'store_month_revenue_std']
+            features.extend(store_stats_features)
+            features.extend(store_month_features)
+            
+            # Merge store stats
+            df = df.merge(store_stats, on=['store', 'date'], how='left')
+            df = df.merge(store_month_stats, on=['store', 'month', 'date'], how='left')
+            
+            # Add lag features from historical data
+            if historical_sales is not None:
+                historical_sales = historical_sales.sort_values(['store', 'date'])
+                for lag in [1, 3, 7, 14, 30]:
+                    df[f'revenue_lag_{lag}'] = historical_sales.groupby('store')['revenue'].last()
+                    df[f'qty_sold_lag_{lag}'] = historical_sales.groupby('store')['qty_sold'].last()
+                    features.extend([f'revenue_lag_{lag}', f'qty_sold_lag_{lag}'])
+                
+                # Add rolling statistics from historical data
+                for window in [7, 14, 30]:
+                    # Use consistent naming for rolling statistics
+                    df[f'revenue_rolling_mean_{window}d'] = historical_sales.groupby('store')['revenue'].transform(
+                        lambda x: x.rolling(window=window, min_periods=1).mean().iloc[-1]
+                    )
+                    df[f'revenue_rolling_std_{window}d'] = historical_sales.groupby('store')['revenue'].transform(
+                        lambda x: x.rolling(window=window, min_periods=1).std().iloc[-1]
+                    )
+                    features.extend([f'revenue_rolling_mean_{window}d', f'revenue_rolling_std_{window}d'])
+            
+        except FileNotFoundError:
+            # If no stats available, create empty stats
+            store_stats_features = ['revenue_median', 'revenue_std',
+                                  'qty_sold_median', 'qty_sold_std']
+            store_month_features = ['store_month_revenue_median', 'store_month_revenue_std']
+            features.extend(store_stats_features)
+            features.extend(store_month_features)
+            
+            # Add empty stats
+            for feat in store_stats_features + store_month_features:
+                df[feat] = 0
+            
+            # Add empty lag features
+            for lag in [1, 3, 7, 14, 30]:
+                df[f'revenue_lag_{lag}'] = 0
+                df[f'qty_sold_lag_{lag}'] = 0
+                features.extend([f'revenue_lag_{lag}', f'qty_sold_lag_{lag}'])
+            
+            # Add empty rolling statistics
+            for window in [7, 14, 30]:
+                # Use consistent naming for rolling statistics
+                df[f'revenue_rolling_mean_{window}d'] = 0
+                df[f'revenue_rolling_std_{window}d'] = 0
+                features.extend([f'revenue_rolling_mean_{window}d', f'revenue_rolling_std_{window}d'])
+    
+    # Fill NaN values in historical features with 0
+    historical_features = [f for f in features if any(x in f for x in ['mean', 'std', 'median', 'lag', 'rolling'])]
+    df[historical_features] = df[historical_features].fillna(0)
+    
     # Add interaction features
     logging.info("Generating interaction features...")
     
-    # 1. Discount and weekend interaction
-    df['discount_weekend_interaction'] = df['discount_pct'] * df['is_weekend']
+    # 1. Store Characteristics Interactions
+    # Store area and city interaction (captures premium locations)
+    df['store_area_city_interaction'] = df['store_area'] * df['city_frequency']
     
-    # 2. Discount and store area bucket interaction
-    df['discount_store_area_interaction'] = df['discount_pct'] * df['store_area_bucket']
+    # Store area and region interaction (captures regional preferences)
+    df['store_area_region_interaction'] = df['store_area'] * df['region_frequency']
     
-    # 3. Region and quarter interaction using label encoding
-    if not is_prediction:
-        region_encoder = LabelEncoder()
-        df['region_encoded'] = region_encoder.fit_transform(df['region'])
-        # Save encoder for prediction
-        with open('models/region_encoder.pkl', 'wb') as f:
-            pickle.dump(region_encoder, f)
-    else:
-        try:
-            with open('models/region_encoder.pkl', 'rb') as f:
-                region_encoder = pickle.load(f)
-            df['region_encoded'] = region_encoder.transform(df['region'])
-        except:
-            df['region_encoded'] = 0  # Default if encoder not found
+    # Online presence and city interaction (captures digital adoption by city)
+    df['online_city_interaction'] = df['is_online'] * df['city_frequency']
     
-    # Create region-quarter interaction
-    df['region_quarter_interaction'] = df['region_encoded'] * df['quarter']
+    # 2. Discount Strategy Interactions
+    # Discount and store tier interaction (captures premium vs regular pricing)
+    df['discount_store_tier_interaction'] = df['discount_pct'] * df['store_area_bucket']
+    
+    # Discount and region interaction (captures regional price sensitivity)
+    df['discount_region_interaction'] = df['discount_pct'] * df['region_frequency']
+    
+    # Discount and city interaction (captures city-specific price sensitivity)
+    df['discount_city_interaction'] = df['discount_pct'] * df['city_frequency']
+    
+    # 3. Temporal Interactions
+    # Month and region interaction (captures seasonal patterns by region)
+    df['month_region_interaction'] = df['month'] * df['region_frequency']
+    
+    # Month and store tier interaction (captures seasonal patterns by store type)
+    df['month_store_tier_interaction'] = df['month'] * df['store_area_bucket']
+    
+    # 4. Historical Performance Interactions
+    # Recent performance and discount interaction
+    df['revenue_lag_7_discount_interaction'] = df['revenue_lag_7'] * df['discount_pct']
+    
+    # Store volatility and discount interaction
+    df['revenue_std_discount_interaction'] = df['revenue_std'] * df['discount_pct']
+    
+    # 5. Complex Interactions
+    # Premium location discount sensitivity
+    df['premium_location_discount'] = df['store_area_city_interaction'] * df['discount_pct']
+    
+    # Seasonal premium location effect
+    df['seasonal_premium_location'] = df['month'] * df['store_area_city_interaction']
+    
+    # Add new interaction features to the feature list
+    interaction_features = [
+        'store_area_city_interaction',
+        'store_area_region_interaction',
+        'online_city_interaction',
+        'discount_store_tier_interaction',
+        'discount_region_interaction',
+        'discount_city_interaction',
+        'month_region_interaction',
+        'month_store_tier_interaction',
+        'revenue_lag_7_discount_interaction',
+        'revenue_std_discount_interaction',
+        'premium_location_discount',
+        'seasonal_premium_location'
+    ]
+    features.extend(interaction_features)
+    
+    # Remove old low-variance interactions
+    old_interactions = [
+        'discount_weekend_interaction',
+        'discount_store_area_interaction',
+        'region_quarter_interaction'
+    ]
+    features = [f for f in features if f not in old_interactions]
     
     # 4. Polynomial interactions
     df['discount_pct_squared'] = df['discount_pct'] ** 2
@@ -236,113 +431,9 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     
     features.extend([
         'discount_pct', 'is_discounted',
-        'discount_weekend_interaction',
-        'discount_store_area_interaction',
-        'region_quarter_interaction',
         'discount_pct_squared',
         'store_area_squared'
     ])
-    
-    # 4. Historical Features
-    logging.info("Generating historical features...")
-    if not is_prediction:
-        # During training, calculate store-level statistics
-        store_stats = df.groupby('store').agg({
-            'revenue': ['mean', 'std', 'median'],
-            'qty_sold': ['mean', 'std', 'median']
-        }).fillna(0)
-        store_stats.columns = ['_'.join(col).strip() for col in store_stats.columns.values]
-        
-        # Calculate store-month seasonal indices
-        store_month_stats = df.groupby(['store', 'month']).agg({
-            'revenue': ['mean', 'std']
-        }).fillna(0)
-        store_month_stats.columns = ['store_month_revenue_mean', 'store_month_revenue_std']
-        
-        # Save store stats for prediction
-        store_stats.to_json('models/store_stats.json')
-        store_month_stats.to_json('models/store_month_stats.json')
-        
-        # Add store stats to features
-        store_stats_features = store_stats.columns.tolist()
-        store_month_features = store_month_stats.columns.tolist()
-        features.extend(store_stats_features)
-        features.extend(store_month_features)
-        
-        # Merge store stats
-        df = df.merge(store_stats, on='store', how='left')
-        df = df.merge(store_month_stats, on=['store', 'month'], how='left')
-    else:
-        # During prediction, load store stats
-        try:
-            store_stats = pd.read_json('models/store_stats.json')
-            store_month_stats = pd.read_json('models/store_month_stats.json')
-            
-            # Ensure store IDs are strings
-            store_stats.index = store_stats.index.astype(str)
-            store_month_stats.index = store_month_stats.index.get_level_values(0).astype(str)
-            
-            # Reset index to make store ID a column
-            store_stats = store_stats.reset_index()
-            store_stats = store_stats.rename(columns={'index': 'store'})
-            
-            store_month_stats = store_month_stats.reset_index()
-            store_month_stats = store_month_stats.rename(columns={'level_0': 'store', 'level_1': 'month'})
-            
-            # Add store stats to features
-            store_stats_features = store_stats.columns.drop('store').tolist()
-            store_month_features = store_month_stats.columns.drop(['store', 'month']).tolist()
-            features.extend(store_stats_features)
-            features.extend(store_month_features)
-            
-            # Merge store stats
-            df = df.merge(store_stats, on='store', how='left')
-            df = df.merge(store_month_stats, on=['store', 'month'], how='left')
-        except:
-            # If no stats available, create empty stats
-            store_stats_features = [
-                'revenue_mean', 'revenue_std', 'revenue_median',
-                'qty_sold_mean', 'qty_sold_std', 'qty_sold_median'
-            ]
-            store_month_features = [
-                'store_month_revenue_mean', 'store_month_revenue_std'
-            ]
-            features.extend(store_stats_features)
-            features.extend(store_month_features)
-            
-            # Add empty stats
-            for feat in store_stats_features:
-                df[feat] = 0
-            for feat in store_month_features:
-                df[feat] = 0
-    
-    # 5. Rolling Statistics
-    logging.info("Generating rolling statistics...")
-    if historical_sales is not None:
-        # Calculate rolling statistics using historical data
-        historical_sales['date'] = pd.to_datetime(historical_sales['date'])
-        historical_sales = historical_sales.sort_values('date')
-        
-        # Calculate rolling means and stds
-        for window in [7, 14, 30]:
-            rolling_mean = historical_sales['revenue'].rolling(window=window, min_periods=1).mean()
-            rolling_std = historical_sales['revenue'].rolling(window=window, min_periods=1).std()
-            
-            df[f'rolling_mean_{window}d'] = rolling_mean.iloc[-1]
-            df[f'rolling_std_{window}d'] = rolling_std.iloc[-1]
-            
-            features.extend([f'rolling_mean_{window}d', f'rolling_std_{window}d'])
-    else:
-        # During training, calculate rolling statistics
-        df = df.sort_values('date')
-        for window in [7, 14, 30]:
-            df[f'rolling_mean_{window}d'] = df.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(window=window, min_periods=1).mean()
-            )
-            df[f'rolling_std_{window}d'] = df.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(window=window, min_periods=1).std()
-            )
-            features.extend([f'rolling_mean_{window}d', f'rolling_std_{window}d'])
     
     # 6. Lead Time Features
     logging.info("Generating lead time features...")
@@ -384,5 +475,8 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     logging.info(f"Final feature count: {len(features)}")
     logging.info(f"Final feature matrix shape: {X.shape}")
     logging.info("Feature engineering complete.")
+    
+    # Remove any duplicate features that might have been created
+    features = list(dict.fromkeys(features))
     
     return X, features
