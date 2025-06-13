@@ -93,8 +93,35 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_predicti
     df['is_month_end'] = df['date'].dt.is_month_end.astype(int)
     df['lead_time_days'] = (df['date'] - pd.Timestamp.today()).dt.days
     
-    features.extend(['day_of_week', 'month', 'quarter', 'year', 'is_weekend', 
-                    'is_month_start', 'is_month_end', 'lead_time_days'])
+    # Add cyclical encoding for temporal features
+    logging.info("Adding cyclical encoding for temporal features...")
+    
+    # Month cyclical encoding (12 months)
+    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+    
+    # Day of week cyclical encoding (7 days)
+    df['day_of_week_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+    df['day_of_week_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+    
+    # Day of month cyclical encoding (assuming max 31 days)
+    df['day_of_month'] = df['date'].dt.day
+    df['day_of_month_sin'] = np.sin(2 * np.pi * df['day_of_month'] / 31)
+    df['day_of_month_cos'] = np.cos(2 * np.pi * df['day_of_month'] / 31)
+    
+    # Add interaction features for seasonality
+    df['month_weekend'] = df['month_sin'] * df['is_weekend']  # Weekend effect varies by month
+    df['month_day'] = df['month_sin'] * df['day_of_week_sin']  # Day effect varies by month
+    
+    # Update features list with new cyclical features
+    features.extend([
+        'day_of_week', 'month', 'quarter', 'year', 'is_weekend', 
+        'is_month_start', 'is_month_end', 'lead_time_days',
+        'month_sin', 'month_cos',
+        'day_of_week_sin', 'day_of_week_cos',
+        'day_of_month_sin', 'day_of_month_cos',
+        'month_weekend', 'month_day'
+    ])
     
     # 2. Store/Location Features
     logging.info("Generating store/location features...")
