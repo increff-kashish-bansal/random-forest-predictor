@@ -22,4 +22,10 @@ models/*.json
 # Distribution / packaging
 dist/
 build/
-*.egg-info/ 
+*.egg-info/
+
+# Large binary files
+*.dylib
+*.so
+*.dll
+*.pyd 
