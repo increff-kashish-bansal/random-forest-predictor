@@ -202,6 +202,38 @@ elif page == "Train":
                         f"Test R²: {results['test_scores']['upper']:.3f}"
                     )
                 
+                # Display prediction interval metrics
+                st.subheader("Prediction Interval Metrics")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric(
+                        "Coverage",
+                        f"{results['prediction_metrics']['coverage']:.1f}%",
+                        help="Percentage of actual values falling within prediction intervals"
+                    )
+                
+                with col2:
+                    st.metric(
+                        "Sharpness",
+                        f"₹{results['prediction_metrics']['sharpness']:,.2f}",
+                        help="Average width of prediction intervals (P90 - P10)"
+                    )
+                
+                with col3:
+                    st.metric(
+                        "RMSE",
+                        f"₹{results['prediction_metrics']['rmse']:,.2f}",
+                        help="Root Mean Squared Error of median predictions"
+                    )
+                
+                with col4:
+                    st.metric(
+                        "MAE",
+                        f"₹{results['prediction_metrics']['mae']:,.2f}",
+                        help="Mean Absolute Error of median predictions"
+                    )
+                
                 # Display feature importances as bar chart
                 importances_df = pd.DataFrame(
                     list(results['feature_importances'].items()),

@@ -58,3 +58,39 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
         'shap_values': shap_values,
         'top_5_features': top_5_features
     }
+
+def calculate_prediction_metrics(y_true: np.ndarray, p10: np.ndarray, p50: np.ndarray, p90: np.ndarray) -> Dict:
+    """
+    Calculate prediction interval coverage and sharpness metrics.
+    
+    Args:
+        y_true: Array of true values
+        p10: Array of 10th percentile predictions
+        p50: Array of 50th percentile predictions
+        p90: Array of 90th percentile predictions
+        
+    Returns:
+        Dictionary containing:
+        - coverage: Percentage of true values falling within prediction intervals
+        - sharpness: Average width of prediction intervals (p90 - p10)
+        - rmse: Root mean squared error of median predictions
+        - mae: Mean absolute error of median predictions
+    """
+    # Calculate coverage
+    in_interval = np.logical_and(y_true >= p10, y_true <= p90)
+    coverage = np.mean(in_interval) * 100
+    
+    # Calculate sharpness
+    interval_width = p90 - p10
+    sharpness = np.mean(interval_width)
+    
+    # Calculate RMSE and MAE for median predictions
+    rmse = np.sqrt(np.mean((y_true - p50) ** 2))
+    mae = np.mean(np.abs(y_true - p50))
+    
+    return {
+        'coverage': coverage,
+        'sharpness': sharpness,
+        'rmse': rmse,
+        'mae': mae
+    }

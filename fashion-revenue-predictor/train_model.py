@@ -11,6 +11,7 @@ from utils.feature_engineering import derive_features
 from scipy.stats import boxcox
 import joblib
 from sklearn.preprocessing import OneHotEncoder
+from predictor import calculate_prediction_metrics
 
 # Configure logging
 logging.basicConfig(
@@ -159,7 +160,15 @@ def train_model(df_sales, df_stores):
     # Train three separate models for different quantiles
     models = {}
     cv_scores = {model_type: [] for model_type in ['median', 'lower', 'upper']}
+    cv_metrics = []  # Store prediction interval metrics for each fold
     selected_features = {}
+    
+    # Define feature names early
+    feature_names = {
+        'all_features': list(X.columns),
+        'lower_features': None,  # Will be set after feature selection
+        'upper_features': None   # Will be set after feature selection
+    }
     
     # 1. Train median model first to get feature importances
     logging.info("Training median model with log transformation...")
@@ -188,6 +197,10 @@ def train_model(df_sales, df_stores):
     # Select features for lower and upper quantile models
     X_lower, selected_features['lower'] = select_features_by_importance(X, sorted_importances, 'lower')
     X_upper, selected_features['upper'] = select_features_by_importance(X, sorted_importances, 'upper')
+    
+    # Update feature names with selected features
+    feature_names['lower_features'] = selected_features['lower']
+    feature_names['upper_features'] = selected_features['upper']
     
     # 2. Train lower tail model with selected features
     logging.info("Training lower tail model with selected features...")
@@ -223,27 +236,41 @@ def train_model(df_sales, df_stores):
     upper_model.fit(X_upper, y, sample_weight=sample_weights)
     models['upper'] = upper_model
     
-    # Log cross-validation scores and feature counts
-    logging.info("Cross-validation scores and feature counts:")
+    # Calculate prediction interval metrics for each fold
+    for train_idx, test_idx in gtscv.split(X, groups=store_ids):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        
+        # Get predictions for this fold
+        p10 = lower_model.predict(X_test[feature_names['lower_features']])
+        p50 = np.expm1(median_model.predict(X_test[feature_names['all_features']]))
+        p90 = upper_model.predict(X_test[feature_names['upper_features']])
+        
+        # Calculate metrics
+        fold_metrics = calculate_prediction_metrics(y_test, p10, p50, p90)
+        cv_metrics.append(fold_metrics)
+    
+    # Calculate average metrics across folds
+    avg_metrics = {
+        'coverage': np.mean([m['coverage'] for m in cv_metrics]),
+        'sharpness': np.mean([m['sharpness'] for m in cv_metrics]),
+        'rmse': np.mean([m['rmse'] for m in cv_metrics]),
+        'mae': np.mean([m['mae'] for m in cv_metrics])
+    }
+    
+    # Log cross-validation scores and metrics
+    logging.info("Cross-validation scores and metrics:")
     for model_type in ['median', 'lower', 'upper']:
         mean_score = np.mean(cv_scores[model_type])
         std_score = np.std(cv_scores[model_type])
         feature_count = len(X.columns) if model_type == 'median' else len(selected_features[model_type])
         logging.info(f"{model_type} - Mean R²: {mean_score:.3f} (±{std_score:.3f}), Features: {feature_count}")
     
-    # Print top 5 features for each model
-    print("\nTop 5 Most Important Features by Model:")
-    for model_type in ['median', 'lower', 'upper']:
-        if model_type == 'median':
-            model_features = sorted_importances
-        else:
-            model_features = dict(zip(selected_features[model_type], 
-                                    models[model_type].feature_importances_))
-            model_features = dict(sorted(model_features.items(), key=lambda x: x[1], reverse=True))
-        
-        print(f"\n{model_type.upper()} Model:")
-        for feat, imp in list(model_features.items())[:5]:
-            print(f"{feat}: {imp:.3f}")
+    logging.info("\nPrediction Interval Metrics:")
+    logging.info(f"Coverage: {avg_metrics['coverage']:.1f}%")
+    logging.info(f"Sharpness: {avg_metrics['sharpness']:.2f}")
+    logging.info(f"RMSE: {avg_metrics['rmse']:.2f}")
+    logging.info(f"MAE: {avg_metrics['mae']:.2f}")
     
     # Save models, features, and selected features
     Path('models').mkdir(exist_ok=True)
@@ -251,13 +278,6 @@ def train_model(df_sales, df_stores):
     features_path = 'models/brandA_features.json'
     selected_features_path = 'models/brandA_selected_features.json'
     feature_names_path = 'models/brandA_feature_names.json'
-    
-    # Save feature names for consistent encoding
-    feature_names = {
-        'all_features': list(X.columns),
-        'lower_features': selected_features['lower'],
-        'upper_features': selected_features['upper']
-    }
     
     joblib.dump(models, model_path, compress=3)
     with open(features_path, 'w') as f:
@@ -288,5 +308,6 @@ def train_model(df_sales, df_stores):
             'median': np.mean(cv_scores['median']),
             'lower': np.mean(cv_scores['upper']),
             'upper': np.mean(cv_scores['upper'])
-        }
+        },
+        'prediction_metrics': avg_metrics
     }
