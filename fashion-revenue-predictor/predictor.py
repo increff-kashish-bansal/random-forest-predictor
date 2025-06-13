@@ -6,6 +6,8 @@ import shap
 from typing import Dict, List, Tuple
 from scipy.special import inv_boxcox
 from utils.feature_engineering import apply_cluster_specific_transforms
+from utils.conformal_calibration import ConformalCalibrator
+import logging
 
 def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     """
@@ -52,18 +54,23 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     p50 = median_pred
     p90 = median_pred + upper_residuals
     
-    # Apply quantile residual smoothing using rolling averages
-    # Convert to pandas Series for rolling operations
-    p10_series = pd.Series(p10)
-    p90_series = pd.Series(p90)
+    # Apply conformal calibration
+    calibrator = ConformalCalibrator(alpha=0.1)  # 90% coverage
     
-    # Apply rolling average with window=3 and min_periods=1
-    smoothed_p10 = p10_series.rolling(window=3, min_periods=1).mean()
-    smoothed_p90 = p90_series.rolling(window=3, min_periods=1).mean()
-    
-    # Convert back to numpy arrays
-    p10 = smoothed_p10.values
-    p90 = smoothed_p90.values
+    # Load historical data for calibration
+    try:
+        historical_data = pd.read_json('models/historical_predictions.json')
+        calibrator.calibrate(
+            y_true=historical_data['revenue'].values,
+            p10=historical_data['p10'].values,
+            p50=historical_data['p50'].values,
+            p90=historical_data['p90'].values
+        )
+        
+        # Apply calibration to new predictions
+        p10, p50, p90 = calibrator.calibrate_predictions(p10, p50, p90)
+    except FileNotFoundError:
+        logging.warning("Historical predictions not found, skipping calibration")
     
     # Calculate SHAP values using median model
     explainer = shap.TreeExplainer(models['median'])

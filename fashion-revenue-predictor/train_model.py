@@ -339,6 +339,7 @@ def train_model(df_sales, df_stores):
         models['upper'] = upper_model
         
         # Calculate prediction interval metrics
+        historical_predictions = []
         for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
             X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
@@ -352,9 +353,22 @@ def train_model(df_sales, df_stores):
             p10 = p50 - lower_residuals
             p90 = p50 + upper_residuals
             
+            # Store predictions for calibration
+            fold_predictions = pd.DataFrame({
+                'revenue': y_test,
+                'p10': p10,
+                'p50': p50,
+                'p90': p90
+            })
+            historical_predictions.append(fold_predictions)
+            
             # Calculate metrics
             fold_metrics = calculate_prediction_metrics(y_test, p10, p50, p90)
             cv_metrics.append(fold_metrics)
+        
+        # Combine and save historical predictions
+        historical_predictions_df = pd.concat(historical_predictions, axis=0)
+        historical_predictions_df.to_json('models/historical_predictions.json')
         
         # Calculate average metrics
         avg_metrics = {
