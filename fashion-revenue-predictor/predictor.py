@@ -123,6 +123,36 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     # After all calibration and sorting, invert log1p transformation for all predictions
     print("DEBUG: Final predictions (p10, p50, p90):", p10, p50, p90)
     
+    # --- Post-processing rules for prediction intervals ---
+    if 'store_weekday_avg' in df_X.columns:
+        p10 = np.maximum(p10, 0.5 * df_X['store_weekday_avg'])
+    if 'revenue_rolling_mean_3d' in df_X.columns:
+        p50 = 0.8 * p50 + 0.2 * df_X['revenue_rolling_mean_3d']
+    if 'revenue_volatility_3d' in df_X.columns:
+        vol = df_X['revenue_volatility_3d'].fillna(0)
+        p10 = np.where(vol > 0.4, p50 - 1.2 * (p50 - p10), p10)
+        p90 = np.where(vol > 0.4, p50 + 1.2 * (p90 - p50), p90)
+    preds = np.vstack([p10, p50, p90])
+    p10, p50, p90 = np.sort(preds, axis=0)
+    if 'store_seasonal_index' in df_X.columns:
+        upper_clip = df_X['store_seasonal_index'] * 1.5 * p50
+        p90 = np.minimum(p90, upper_clip)
+    shap_sum = np.abs(shap_values).sum(axis=1)
+    if 'revenue_rolling_mean_7d' in df_X.columns:
+        p50 = np.where(shap_sum < 0.1, df_X['revenue_rolling_mean_7d'], p50)
+    if 'store_month_revenue_median' in df_X.columns and 'store_month_revenue_std' in df_X.columns:
+        upper_bound = df_X['store_month_revenue_median'] + 1.5 * df_X['store_month_revenue_std']
+        p90 = np.minimum(p90, upper_bound)
+    if all([f'revenue_lag_{lag}' in df_X.columns for lag in [7, 14, 30]]):
+        rolling_avg = (df_X['revenue_lag_7'] + df_X['revenue_lag_14'] + df_X['revenue_lag_30']) / 3
+        p50 = 0.75 * p50 + 0.25 * rolling_avg
+    if 'premium_location_discount' in df_X.columns:
+        boost = 0.1 * df_X['premium_location_discount']
+        p90 += boost
+    if 'city_encoded' in df_X.columns and 'revenue_last_3_days' in df_X.columns:
+        fallback = 0.5 * df_X['revenue_last_3_days'] + 0.5 * df_X['city_encoded']
+        p50 = np.where(shap_sum < 0.05, fallback, p50)
+    
     return {
         'p10': p10,
         'p50': p50,
