@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit
 from utils.feature_engineering import derive_features
 from scipy.stats import boxcox
 
@@ -20,6 +20,30 @@ logging.basicConfig(
     ]
 )
 
+def calculate_dynamic_test_size(df: pd.DataFrame, store: str) -> float:
+    """
+    Calculate dynamic test size based on store's historical data length.
+    
+    Args:
+        df: DataFrame with sales data
+        store: Store ID
+        
+    Returns:
+        Float between 0.1 and 0.3 representing test size
+    """
+    store_data = df[df['store'] == store]
+    data_length = len(store_data)
+    
+    # Base test size on data length
+    if data_length < 30:  # Less than a month
+        return 0.1
+    elif data_length < 90:  # Less than 3 months
+        return 0.15
+    elif data_length < 180:  # Less than 6 months
+        return 0.2
+    else:  # More than 6 months
+        return 0.3
+
 def train_model(df_sales, df_stores):
     """Train a random forest model for revenue prediction."""
     logging.info("Starting model training...")
@@ -29,18 +53,24 @@ def train_model(df_sales, df_stores):
     X, features = derive_features(df_sales, df_stores, is_prediction=False)
     y = df_sales['revenue'].values
     
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    logging.info(f"Training set shape: {X_train.shape}")
-    logging.info(f"Test set shape: {X_test.shape}")
+    # Sort data by date
+    df_sales['date'] = pd.to_datetime(df_sales['date'])
+    date_order = df_sales['date'].values
+    sort_idx = np.argsort(date_order)
+    X = X.iloc[sort_idx]
+    y = y[sort_idx]
+    
+    # Initialize TimeSeriesSplit with more splits
+    n_splits = 10
+    tscv = TimeSeriesSplit(n_splits=n_splits)
     
     # Train three separate models for different quantiles
     models = {}
+    cv_scores = {model_type: [] for model_type in ['median', 'lower', 'upper']}
     
     # 1. Median (0.5 quantile) model - use log transformation
     logging.info("Training median model with log transformation...")
-    y_train_log = np.log1p(y_train)
-    y_test_log = np.log1p(y_test)
+    y_log = np.log1p(y)
     
     median_model = RandomForestRegressor(
         n_estimators=100,
@@ -49,7 +79,19 @@ def train_model(df_sales, df_stores):
         min_samples_leaf=2,
         random_state=42
     )
-    median_model.fit(X_train, y_train_log)
+    
+    # Perform time series cross-validation
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y_log[train_idx], y_log[test_idx]
+        
+        median_model.fit(X_train, y_train)
+        y_pred = median_model.predict(X_test)
+        score = np.corrcoef(y_test, y_pred)[0,1]**2
+        cv_scores['median'].append(score)
+    
+    # Train final median model on all data
+    median_model.fit(X, y_log)
     models['median'] = median_model
     
     # 2. Lower tail (0.1 quantile) model - use untransformed data
@@ -61,7 +103,19 @@ def train_model(df_sales, df_stores):
         min_samples_leaf=2,
         random_state=42
     )
-    lower_model.fit(X_train, y_train)
+    
+    # Perform time series cross-validation
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        
+        lower_model.fit(X_train, y_train)
+        y_pred = lower_model.predict(X_test)
+        score = np.corrcoef(y_test, y_pred)[0,1]**2
+        cv_scores['lower'].append(score)
+    
+    # Train final lower model on all data
+    lower_model.fit(X, y)
     models['lower'] = lower_model
     
     # 3. Upper tail (0.9 quantile) model - use untransformed data
@@ -73,38 +127,30 @@ def train_model(df_sales, df_stores):
         min_samples_leaf=2,
         random_state=42
     )
-    upper_model.fit(X_train, y_train)
+    
+    # Perform time series cross-validation
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        
+        upper_model.fit(X_train, y_train)
+        y_pred = upper_model.predict(X_test)
+        score = np.corrcoef(y_test, y_pred)[0,1]**2
+        cv_scores['upper'].append(score)
+    
+    # Train final upper model on all data
+    upper_model.fit(X, y)
     models['upper'] = upper_model
     
-    # Evaluate models
-    train_scores = {}
-    test_scores = {}
-    
-    # Median model evaluation
-    train_pred_median = np.expm1(median_model.predict(X_train))
-    test_pred_median = np.expm1(median_model.predict(X_test))
-    train_scores['median'] = np.corrcoef(y_train, train_pred_median)[0,1]**2
-    test_scores['median'] = np.corrcoef(y_test, test_pred_median)[0,1]**2
-    
-    # Lower tail model evaluation
-    train_pred_lower = lower_model.predict(X_train)
-    test_pred_lower = lower_model.predict(X_test)
-    train_scores['lower'] = np.corrcoef(y_train, train_pred_lower)[0,1]**2
-    test_scores['lower'] = np.corrcoef(y_test, test_pred_lower)[0,1]**2
-    
-    # Upper tail model evaluation
-    train_pred_upper = upper_model.predict(X_train)
-    test_pred_upper = upper_model.predict(X_test)
-    train_scores['upper'] = np.corrcoef(y_train, train_pred_upper)[0,1]**2
-    test_scores['upper'] = np.corrcoef(y_test, test_pred_upper)[0,1]**2
-    
-    # Log scores
-    logging.info("Model evaluation scores:")
+    # Log cross-validation scores
+    logging.info("Cross-validation scores:")
     for model_type in ['median', 'lower', 'upper']:
-        logging.info(f"{model_type} - Train R²: {train_scores[model_type]:.3f}, Test R²: {test_scores[model_type]:.3f}")
+        mean_score = np.mean(cv_scores[model_type])
+        std_score = np.std(cv_scores[model_type])
+        logging.info(f"{model_type} - Mean R²: {mean_score:.3f} (±{std_score:.3f})")
     
     # Get feature importances from median model
-    importances = dict(zip(X_train.columns, median_model.feature_importances_))
+    importances = dict(zip(X.columns, median_model.feature_importances_))
     sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
     
     # Print top 5 features
@@ -130,7 +176,6 @@ def train_model(df_sales, df_stores):
     
     # Return training metrics
     return {
-        'train_scores': train_scores,
-        'test_scores': test_scores,
+        'cv_scores': cv_scores,
         'feature_importances': sorted_importances
     }

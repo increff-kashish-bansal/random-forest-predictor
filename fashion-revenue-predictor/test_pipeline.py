@@ -88,9 +88,11 @@ def test_training(df_sales, df_stores):
         results = train_model(df_sales, df_stores)
         logging.info("Training completed successfully")
         
-        # Log scores for each model
+        # Log cross-validation scores for each model
         for model_type in ['median', 'lower', 'upper']:
-            logging.info(f"{model_type} - Train R²: {results['train_scores'][model_type]:.3f}, Test R²: {results['test_scores'][model_type]:.3f}")
+            mean_score = np.mean(results['cv_scores'][model_type])
+            std_score = np.std(results['cv_scores'][model_type])
+            logging.info(f"{model_type} - Mean R²: {mean_score:.3f} (±{std_score:.3f})")
         
         logging.info("Top 5 features:")
         for feat, imp in list(results['feature_importances'].items())[:5]:
