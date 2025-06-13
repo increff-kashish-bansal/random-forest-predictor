@@ -272,8 +272,31 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             lambda x: x.rolling(30, min_periods=1).mean()
         )
         
+        # Add rolling statistical features
+        df['rolling_std_7d'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.rolling(7, min_periods=1).std()
+        )
+        df['rolling_std_30d'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.rolling(30, min_periods=1).std()
+        )
+        df['rolling_min_7d'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.rolling(7, min_periods=1).min()
+        )
+        df['rolling_max_7d'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.rolling(7, min_periods=1).max()
+        )
+        df['rolling_skew_7d'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.rolling(7, min_periods=1).skew()
+        )
+        
         # Add lag features to feature list
-        features.extend(['lag_1', 'lag_7', 'rolling_mean_7d', 'rolling_mean_30d'])
+        features.extend([
+            'lag_1', 'lag_7', 
+            'rolling_mean_7d', 'rolling_mean_30d',
+            'rolling_std_7d', 'rolling_std_30d',
+            'rolling_min_7d', 'rolling_max_7d',
+            'rolling_skew_7d'
+        ])
         
         # Save lag parameters for prediction
         lag_params = {
@@ -300,17 +323,52 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             df['rolling_mean_30d'] = combined_sales.groupby('store')['revenue'].transform(
                 lambda x: x.rolling(30, min_periods=1).mean()
             ).iloc[-len(df):]
+            
+            # Calculate rolling statistical features using combined data
+            df['rolling_std_7d'] = combined_sales.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(7, min_periods=1).std()
+            ).iloc[-len(df):]
+            df['rolling_std_30d'] = combined_sales.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(30, min_periods=1).std()
+            ).iloc[-len(df):]
+            df['rolling_min_7d'] = combined_sales.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(7, min_periods=1).min()
+            ).iloc[-len(df):]
+            df['rolling_max_7d'] = combined_sales.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(7, min_periods=1).max()
+            ).iloc[-len(df):]
+            df['rolling_skew_7d'] = combined_sales.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(7, min_periods=1).skew()
+            ).iloc[-len(df):]
         else:
             # If no historical data available, use zeros
-            lag_features = ['lag_1', 'lag_7', 'rolling_mean_7d', 'rolling_mean_30d']
+            lag_features = [
+                'lag_1', 'lag_7', 
+                'rolling_mean_7d', 'rolling_mean_30d',
+                'rolling_std_7d', 'rolling_std_30d',
+                'rolling_min_7d', 'rolling_max_7d',
+                'rolling_skew_7d'
+            ]
             for feature in lag_features:
                 df[feature] = 0
         
         # Add lag features to feature list
-        features.extend(['lag_1', 'lag_7', 'rolling_mean_7d', 'rolling_mean_30d'])
+        features.extend([
+            'lag_1', 'lag_7', 
+            'rolling_mean_7d', 'rolling_mean_30d',
+            'rolling_std_7d', 'rolling_std_30d',
+            'rolling_min_7d', 'rolling_max_7d',
+            'rolling_skew_7d'
+        ])
     
     # Fill NaN values in lag features with 0
-    lag_features = ['lag_1', 'lag_7', 'rolling_mean_7d', 'rolling_mean_30d']
+    lag_features = [
+        'lag_1', 'lag_7', 
+        'rolling_mean_7d', 'rolling_mean_30d',
+        'rolling_std_7d', 'rolling_std_30d',
+        'rolling_min_7d', 'rolling_max_7d',
+        'rolling_skew_7d'
+    ]
     df[lag_features] = df[lag_features].fillna(0)
     
     # Select features and handle missing values
