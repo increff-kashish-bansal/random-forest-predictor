@@ -8,6 +8,8 @@ import logging
 import json
 from pathlib import Path
 from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
+import matplotlib.pyplot as plt
 
 # Configure logging
 logging.basicConfig(
@@ -174,8 +176,11 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
         pca = PCA(n_components=0.95)  # Keep 95% of variance
         X_cluster_pca = pca.fit_transform(X_cluster)
         
-        n_clusters = min(4, len(df))  # Ensure n_clusters <= n_samples
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+        # Find optimal number of clusters
+        optimal_clusters = find_optimal_clusters(X_cluster_pca)
+        logging.info(f"Optimal number of clusters determined: {optimal_clusters}")
+        
+        kmeans = KMeans(n_clusters=optimal_clusters, random_state=42, n_init=10)
         df['store_cluster'] = kmeans.fit_predict(X_cluster_pca)
         
         # Save cluster information for prediction
@@ -185,7 +190,8 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
             'feature_scales': [float(x) for x in scaler.scale_],
             'pca_components': pca.components_.tolist(),
             'pca_mean': pca.mean_.tolist(),
-            'cluster_features': cluster_features
+            'cluster_features': cluster_features,
+            'n_clusters': optimal_clusters
         }
         with open('models/store_clusters.json', 'w') as f:
             json.dump(cluster_info, f)
@@ -226,9 +232,12 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
         0: 'SMALL_OFFLINE',
         1: 'MEDIUM_OFFLINE',
         2: 'LARGE_OFFLINE',
-        3: 'ONLINE'
+        3: 'ONLINE',
+        4: 'PREMIUM_OFFLINE'  # Added for potential additional clusters
     }
-    df['store_cluster'] = df['store_cluster'].map(cluster_labels)
+    # Only use the labels that correspond to actual clusters
+    actual_labels = {i: cluster_labels[i] for i in range(optimal_clusters)}
+    df['store_cluster'] = df['store_cluster'].map(actual_labels)
     
     # 5. Add store density features
     # Calculate stores per city
@@ -272,4 +281,49 @@ def get_store_features(df_stores: pd.DataFrame) -> List[str]:
         feature_cols = [col for col in df_stores.columns if col.startswith(prefix)]
         features.extend(feature_cols)
     
-    return features 
+    return features
+
+def find_optimal_clusters(X: np.ndarray, max_clusters: int = 10) -> int:
+    """
+    Find optimal number of clusters using elbow method and silhouette score.
+    
+    Args:
+        X: Feature matrix
+        max_clusters: Maximum number of clusters to try
+        
+    Returns:
+        Optimal number of clusters
+    """
+    # Calculate inertia and silhouette scores for different k values
+    inertias = []
+    silhouette_scores = []
+    k_values = range(2, min(max_clusters + 1, len(X)))
+    
+    for k in k_values:
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        kmeans.fit(X)
+        inertias.append(kmeans.inertia_)
+        
+        # Calculate silhouette score
+        if len(X) > k:  # Silhouette score requires more samples than clusters
+            labels = kmeans.labels_
+            silhouette_scores.append(silhouette_score(X, labels))
+    
+    # Find elbow point using second derivative
+    if len(inertias) > 2:
+        # Calculate second derivative of inertia
+        second_derivative = np.diff(np.diff(inertias))
+        elbow_k = np.argmax(second_derivative) + 2  # +2 because we lost 2 points in diff
+        
+        # Find best silhouette score
+        best_silhouette_k = k_values[np.argmax(silhouette_scores)]
+        
+        # Use the average of both methods, rounded to nearest integer
+        optimal_k = int(np.round((elbow_k + best_silhouette_k) / 2))
+        
+        # Ensure optimal_k is within reasonable bounds
+        optimal_k = max(2, min(optimal_k, max_clusters))
+    else:
+        optimal_k = 2
+    
+    return optimal_k 
