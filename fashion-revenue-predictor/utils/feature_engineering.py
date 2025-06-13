@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 import os
 from datetime import datetime, timedelta
+import pickle
 
 # Configure logging
 logging.basicConfig(
@@ -178,7 +179,48 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     # Ensure discount percentage is between 0 and 1
     df['discount_pct'] = df['discount_pct'].clip(0, 1)
     df['is_discounted'] = (df['discount_pct'] > 0).astype(int)
-    features.extend(['discount_pct', 'is_discounted'])
+    
+    # Add interaction features
+    logging.info("Generating interaction features...")
+    
+    # 1. Discount and weekend interaction
+    df['discount_weekend_interaction'] = df['discount_pct'] * df['is_weekend']
+    
+    # 2. Discount and store area bucket interaction
+    df['discount_store_area_interaction'] = df['discount_pct'] * df['store_area_bucket']
+    
+    # 3. Region and quarter interaction using label encoding
+    # Create label encoded region
+    if not is_prediction:
+        region_encoder = LabelEncoder()
+        df['region_encoded'] = region_encoder.fit_transform(df['region'])
+        # Save encoder for prediction
+        with open('models/region_encoder.pkl', 'wb') as f:
+            pickle.dump(region_encoder, f)
+    else:
+        try:
+            with open('models/region_encoder.pkl', 'rb') as f:
+                region_encoder = pickle.load(f)
+            df['region_encoded'] = region_encoder.transform(df['region'])
+        except:
+            df['region_encoded'] = 0  # Default if encoder not found
+    
+    # Create region-quarter interaction
+    df['region_quarter_interaction'] = df['region_encoded'] * df['quarter']
+    
+    # 4. Polynomial interactions for top features (to be determined by SHAP)
+    # For now, we'll add polynomial interactions for discount_pct and store_area
+    df['discount_pct_squared'] = df['discount_pct'] ** 2
+    df['store_area_squared'] = df['store_area'] ** 2
+    
+    features.extend([
+        'discount_pct', 'is_discounted',
+        'discount_weekend_interaction',
+        'discount_store_area_interaction',
+        'region_quarter_interaction',
+        'discount_pct_squared',
+        'store_area_squared'
+    ])
     
     # 4. Historical Features
     logging.info("Generating historical features...")
