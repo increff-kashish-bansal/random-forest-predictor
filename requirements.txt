@@ -1,0 +1,9 @@
+streamlit
+pandas
+scikit-learn
+xgboost
+lightgbm
+prophet
+statsmodels
+pmdarima
+gluonts
