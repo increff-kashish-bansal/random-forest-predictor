@@ -65,13 +65,14 @@ def generate_synthetic_data(n_stores=10, n_days=90):
             disc_value = revenue * np.random.uniform(0, 0.3)
             
             # Calculate discount percentage
-            disc_perc = disc_value / (revenue + disc_value)
+            disc_perc = disc_value * 100 / (revenue + disc_value)
             
             sale = {
                 'store': store['id'],
                 'date': date,
                 'qty_sold': qty_sold,
                 'revenue': revenue,
+                'disc_value': disc_value,
                 'disc_perc': disc_perc
             }
             sales.append(sale)
@@ -127,6 +128,7 @@ def test_prediction(df_sales, df_stores):
             'date': [future_date],
             'qty_sold': [0],
             'revenue': [0],
+            'disc_value': [0],
             'disc_perc': [0]
         })
         

@@ -124,6 +124,89 @@ def apply_cluster_specific_transforms(df: pd.DataFrame, cluster: str) -> pd.Data
     
     return df
 
+def compute_disc_perc(df):
+    # Compute discount percentage as per user formula
+    df = df.copy()
+    df['disc_perc'] = df['disc_value'] * 100 / (df['disc_value'] + df['revenue'])
+    df['disc_perc'] = df['disc_perc'].fillna(0).clip(0, 100)
+    return df
+
+# --- Feature: Demand Shape Calibration (3-month moving average trend) ---
+def add_demand_trend(df, date_col='date', store_col='store', revenue_col='revenue'):
+    df = df.sort_values([store_col, date_col])
+    df['revenue_rolling_mean_90d'] = (
+        df.groupby(store_col)[revenue_col]
+        .transform(lambda x: x.rolling(window=90, min_periods=1).mean())
+    )
+    df['demand_trend'] = (
+        df.groupby(store_col)[revenue_col]
+        .transform(lambda x: x.rolling(window=7, min_periods=1).mean())
+        / (df['revenue_rolling_mean_90d'] + 1e-6)
+    )
+    return df
+
+# --- Feature: Event-Aware Discount Interaction ---
+def add_event_discount_interaction(df, holiday_col='is_holiday', weekend_col='is_weekend', disc_perc_col='disc_perc'):
+    if holiday_col not in df.columns:
+        df[holiday_col] = 0  # Placeholder if not present
+    df['is_event'] = df[holiday_col].fillna(0).astype(int) | df[weekend_col].fillna(0).astype(int)
+    df['event_discount_interaction'] = df['is_event'] * df[disc_perc_col]
+    return df
+
+# --- Feature: Promotion Recency ---
+def add_days_since_last_promo(df, date_col='date', store_col='store', promo_col='disc_value'):
+    df = df.sort_values([store_col, date_col])
+    def days_since_last(x):
+        last = -1
+        out = []
+        for i, v in enumerate(x[promo_col] > 0):
+            if v:
+                last = i
+            out.append(i - last if last != -1 else i)
+        return pd.Series(out, index=x.index)
+    df['days_since_last_promo'] = df.groupby(store_col, group_keys=False).apply(days_since_last)
+    return df
+
+# --- Feature: Channel-Seasonality Cross Term ---
+def add_channel_seasonality_interaction(df, channel_col='channel_encoded', month_sin_col='month_sin', month_cos_col='month_cos'):
+    df['channel_month_sin'] = df[channel_col] * df[month_sin_col]
+    df['channel_month_cos'] = df[channel_col] * df[month_cos_col]
+    return df
+
+# --- Feature: Rolling Discount Intensity ---
+def add_rolling_discount_intensity(df, store_col='store', disc_perc_col='disc_perc', date_col='date'):
+    df = df.sort_values([store_col, date_col])
+    df['discount_rolling_mean_14d'] = (
+        df.groupby(store_col)[disc_perc_col]
+        .transform(lambda x: x.rolling(window=14, min_periods=1).mean())
+    )
+    df['discount_rolling_std_14d'] = (
+        df.groupby(store_col)[disc_perc_col]
+        .transform(lambda x: x.rolling(window=14, min_periods=1).std())
+    )
+    return df
+
+# --- Feature: First Appearance of Store (since no product_id) ---
+def add_first_appearance_flag(df, store_col='store', date_col='date'):
+    df = df.sort_values([store_col, date_col])
+    df['is_first_appearance_of_store'] = (
+        df.groupby(store_col).cumcount() == 0
+    ).astype(int)
+    return df
+
+# --- Feature: Drop High-Leverage Outliers ---
+def drop_high_leverage_outliers(df, revenue_col='revenue', quantile=0.995):
+    threshold = df[revenue_col].quantile(quantile)
+    return df[df[revenue_col] <= threshold]
+
+# --- Feature: Seasonal Volatility Ratio ---
+def add_seasonal_volatility_ratio(df, store_col='store', revenue_col='revenue', date_col='date'):
+    df = df.sort_values([store_col, date_col])
+    rolling_mean = df.groupby(store_col)[revenue_col].transform(lambda x: x.rolling(window=30, min_periods=1).mean())
+    rolling_std = df.groupby(store_col)[revenue_col].transform(lambda x: x.rolling(window=30, min_periods=1).std())
+    df['seasonal_volatility_ratio'] = rolling_std / (rolling_mean + 1e-6)
+    return df
+
 def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_sales: pd.DataFrame = None, is_prediction: bool = False) -> Tuple[pd.DataFrame, List[str]]:
     """
     Derive features for model training or prediction.
@@ -159,6 +242,8 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         if historical_sales is not None and col in historical_sales.columns:
             historical_sales[col] = historical_sales[col].astype(str)
     
+    # Calculate days_since_last_promo on df_sales before merge
+    df_sales = add_days_since_last_promo(df_sales)
     # Merge sales and store data
     df = df_sales.merge(df_stores, left_on='store', right_on='id', how='left')
     logging.info(f"Merged data shape: {df.shape}")
@@ -893,5 +978,27 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         if np.isnan(X).sum() > 0 or np.isinf(X).sum() > 0:
             print("Feature array contains NaN or Inf values.")
         X = np.nan_to_num(X)
+    
+    # Demand Shape Calibration
+    df = add_demand_trend(df)
+    # Event-Aware Discount Interaction
+    df = add_event_discount_interaction(df)
+    # Promotion Recency
+    df = add_days_since_last_promo(df)
+    # Channel-Seasonality Cross Term (after channel_encoded and month_sin/cos are created)
+    df = add_channel_seasonality_interaction(df)
+    # Rolling Discount Intensity
+    df = add_rolling_discount_intensity(df)
+    # First Appearance of Store
+    df = add_first_appearance_flag(df)
+    # Seasonal Volatility Ratio
+    df = add_seasonal_volatility_ratio(df)
+    # Add new features to features list if not already present
+    for col in ['revenue_rolling_mean_90d', 'demand_trend', 'is_event', 'event_discount_interaction',
+                'days_since_last_promo', 'channel_month_sin', 'channel_month_cos',
+                'discount_rolling_mean_14d', 'discount_rolling_std_14d',
+                'is_first_appearance_of_store', 'seasonal_volatility_ratio']:
+        if col in df.columns and col not in features:
+            features.append(col)
     
     return X, features

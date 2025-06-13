@@ -140,7 +140,7 @@ if page == "Upload":
                     # Ensure we don't divide by zero and handle negative values
                     df_sales['disc_perc'] = np.where(
                         (df_sales['revenue'] + df_sales['disc_value']) > 0,
-                        df_sales['disc_value'] / (df_sales['revenue'] + df_sales['disc_value']),
+                        df_sales['disc_value'] * 100 / (df_sales['revenue'] + df_sales['disc_value']),
                         0
                     )
                     
@@ -353,6 +353,7 @@ elif page == "Predict":
                     'date': [pd.Timestamp(future_date)],
                     'qty_sold': [0],
                     'revenue': [0],
+                    'disc_value': [0],  # Placeholder, user can update if needed
                     'disc_perc': [discount_pct]  # Already in decimal form
                 })
                 
