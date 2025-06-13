@@ -881,11 +881,27 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     
     # Clip extreme values
     for col in X.columns:
-        if X[col].dtype in [np.float32, np.float64]:
+        if X[col].dtypes in [np.float32, np.float64]:
             X[col] = X[col].clip(-1e6, 1e6)
     
     # Fill any remaining NaN values with 0
     X = X.fillna(0)
+    
+    # Ensure all features are present in prediction mode
+    if is_prediction:
+        try:
+            with open('models/brandA_feature_names.json', 'r') as f:
+                saved_features = json.load(f)
+            
+            # Ensure all required features are present
+            for feature_set in saved_features.values():
+                missing_features = set(feature_set) - set(X.columns)
+                if missing_features:
+                    for feat in missing_features:
+                        X[feat] = 0  # Add missing features with zeros
+                        features.append(feat)  # Add to feature list
+        except FileNotFoundError:
+            raise ValueError("Feature names file not found. Please train the model first.")
     
     logging.info(f"Final feature count: {len(features)}")
     logging.info(f"Final feature matrix shape: {X.shape}")
