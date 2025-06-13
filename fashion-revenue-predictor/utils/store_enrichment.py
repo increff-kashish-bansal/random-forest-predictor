@@ -38,6 +38,31 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
     if 'store_id' not in df.columns and 'id' in df.columns:
         df = df.rename(columns={'id': 'store_id'})
     
+    # Add temporal interaction features
+    # 1. Festival season interaction with discount
+    festival_months = [10, 11, 12, 1, 2]  # October to February (Diwali, Christmas, New Year)
+    df['is_festival_season'] = df['month'].isin(festival_months).astype(int)
+    df['festival_discount_interaction'] = df['is_festival_season'] * df['discount_pct']
+    
+    # 2. Store cluster interaction with month
+    # Create one-hot encoded month features
+    month_dummies = pd.get_dummies(df['month'], prefix='month')
+    df = pd.concat([df, month_dummies], axis=1)
+    
+    # Get store cluster dummies
+    cluster_dummies = pd.get_dummies(df['store_cluster'], prefix='cluster')
+    df = pd.concat([df, cluster_dummies], axis=1)
+    
+    # Create cluster-month interactions
+    for cluster_col in cluster_dummies.columns:
+        for month_col in month_dummies.columns:
+            interaction_name = f"{cluster_col}_{month_col}_interaction"
+            df[interaction_name] = df[cluster_col] * df[month_col]
+    
+    # 3. Weekend interaction with discount
+    df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)  # Assuming 5,6 are weekend days
+    df['weekend_discount_interaction'] = df['is_weekend'] * df['discount_pct']
+    
     # 1. Add state information based on city
     city_to_state = {
         'MUMBAI': 'MAHARASHTRA',
