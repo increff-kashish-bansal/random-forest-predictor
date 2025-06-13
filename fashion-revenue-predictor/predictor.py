@@ -9,12 +9,13 @@ from utils.feature_engineering import apply_cluster_specific_transforms
 from utils.conformal_calibration import ConformalCalibrator
 import logging
 
-def predict_and_explain(df_X: pd.DataFrame) -> Dict:
+def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = None) -> Dict:
     """
     Make predictions and generate SHAP explanations for input data.
     
     Args:
         df_X: DataFrame with features matching the model's expected input
+        historical_sales: DataFrame with recent historical sales for the store (optional, for p10 floor)
         
     Returns:
         Dictionary containing:
@@ -99,6 +100,13 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
         p10, p50, p90 = preds_sorted[0], preds_sorted[1], preds_sorted[2]
     except FileNotFoundError:
         logging.warning("Historical predictions not found, skipping calibration")
+    
+    # --- Set minimum floor for p10 as 5% of store's historical average revenue ---
+    if historical_sales is not None and not historical_sales.empty:
+        # Compute average daily revenue for the store
+        avg_revenue = historical_sales['revenue'].mean()
+        min_revenue_floor = 0.05 * avg_revenue
+        p10 = np.maximum(p10, min_revenue_floor)
     
     # Calculate SHAP values using median model
     explainer = shap.TreeExplainer(models['median'])

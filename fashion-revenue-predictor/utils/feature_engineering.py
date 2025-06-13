@@ -569,31 +569,43 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             if historical_sales is not None:
                 historical_sales = historical_sales.sort_values(['store', 'date'])
                 for lag in [1, 3, 7, 14, 30]:
-                    df[f'revenue_lag_{lag}'] = historical_sales.groupby('store')['revenue'].last()
+                    df[f'revenue_lag_{lag}'] = df.apply(
+                        lambda row: historical_sales[
+                            (historical_sales['store'] == row['store']) &
+                            (historical_sales['date'] == (row['date'] - pd.Timedelta(days=lag)))
+                        ]['revenue'].values[0]
+                        if not historical_sales[
+                            (historical_sales['store'] == row['store']) &
+                            (historical_sales['date'] == (row['date'] - pd.Timedelta(days=lag)))
+                        ]['revenue'].empty else np.nan,
+                        axis=1
+                    )
                     features.extend([f'revenue_lag_{lag}'])
-                
                 # Add lag-based difference features to capture trends
-                # Revenue differences
                 df['revenue_lag_diff_1_3'] = df['revenue_lag_1'] - df['revenue_lag_3']
                 df['revenue_lag_diff_3_7'] = df['revenue_lag_3'] - df['revenue_lag_7']
                 df['revenue_lag_diff_7_14'] = df['revenue_lag_7'] - df['revenue_lag_14']
                 df['revenue_lag_diff_14_30'] = df['revenue_lag_14'] - df['revenue_lag_30']
-                
-                # Add difference features to feature list
                 diff_features = [
                     'revenue_lag_diff_1_3', 'revenue_lag_diff_3_7',
                     'revenue_lag_diff_7_14', 'revenue_lag_diff_14_30'
                 ]
                 features.extend(diff_features)
-                
                 # Add rolling statistics from historical data
                 for window in [7, 14, 30]:
-                    # Use consistent naming for rolling statistics
-                    df[f'revenue_rolling_mean_{window}d'] = historical_sales.groupby('store')['revenue'].transform(
-                        lambda x: x.rolling(window=window, min_periods=1).mean().iloc[-1]
+                    df[f'revenue_rolling_mean_{window}d'] = df.apply(
+                        lambda row: historical_sales[
+                            (historical_sales['store'] == row['store']) &
+                            (historical_sales['date'] < row['date'])
+                        ].sort_values('date')['revenue'].tail(window).mean(),
+                        axis=1
                     )
-                    df[f'revenue_rolling_std_{window}d'] = historical_sales.groupby('store')['revenue'].transform(
-                        lambda x: x.rolling(window=window, min_periods=1).std().iloc[-1]
+                    df[f'revenue_rolling_std_{window}d'] = df.apply(
+                        lambda row: historical_sales[
+                            (historical_sales['store'] == row['store']) &
+                            (historical_sales['date'] < row['date'])
+                        ].sort_values('date')['revenue'].tail(window).std(),
+                        axis=1
                     )
                     features.extend([f'revenue_rolling_mean_{window}d', f'revenue_rolling_std_{window}d'])
             
