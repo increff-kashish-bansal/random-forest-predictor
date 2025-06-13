@@ -126,6 +126,57 @@ def train_model(df_sales, df_stores):
     logging.info("Starting model training...")
     logging.info(f"Input shapes - Sales: {df_sales.shape}, Stores: {df_stores.shape}")
     
+    # Analyze revenue distribution
+    logging.info("\nRevenue Distribution Analysis:")
+    revenue_stats = df_sales['revenue'].describe()
+    logging.info("\nRevenue Statistics:")
+    logging.info(f"Count: {revenue_stats['count']:.0f}")
+    logging.info(f"Mean: {revenue_stats['mean']:.2f}")
+    logging.info(f"Std: {revenue_stats['std']:.2f}")
+    logging.info(f"Min: {revenue_stats['min']:.2f}")
+    logging.info(f"25%: {revenue_stats['25%']:.2f}")
+    logging.info(f"50%: {revenue_stats['50%']:.2f}")
+    logging.info(f"75%: {revenue_stats['75%']:.2f}")
+    logging.info(f"Max: {revenue_stats['max']:.2f}")
+    
+    # Check for missing values
+    missing_revenue = df_sales['revenue'].isnull().sum()
+    if missing_revenue > 0:
+        logging.warning(f"Found {missing_revenue} missing values in revenue column")
+        # Fill missing values with median revenue for that store
+        df_sales['revenue'] = df_sales.groupby('store')['revenue'].transform(
+            lambda x: x.fillna(x.median())
+        )
+        logging.info("Filled missing revenue values with store-specific medians")
+    
+    # Check for zeros and extreme outliers
+    zero_revenue = (df_sales['revenue'] == 0).sum()
+    if zero_revenue > 0:
+        logging.warning(f"Found {zero_revenue} zero revenue entries")
+    
+    # Calculate outlier thresholds using IQR method
+    Q1 = revenue_stats['25%']
+    Q3 = revenue_stats['75%']
+    IQR = Q3 - Q1
+    lower_bound = Q1 - 1.5 * IQR
+    upper_bound = Q3 + 1.5 * IQR
+    
+    outliers = df_sales[(df_sales['revenue'] < lower_bound) | (df_sales['revenue'] > upper_bound)]
+    if len(outliers) > 0:
+        logging.warning(f"Found {len(outliers)} revenue outliers")
+        logging.info(f"Outlier bounds: [{lower_bound:.2f}, {upper_bound:.2f}]")
+        
+        # Cap outliers instead of removing them
+        df_sales['revenue'] = df_sales['revenue'].clip(lower=lower_bound, upper=upper_bound)
+        logging.info("Capped revenue outliers using IQR method")
+    
+    # Log revenue distribution after cleaning
+    logging.info("\nRevenue Distribution After Cleaning:")
+    clean_stats = df_sales['revenue'].describe()
+    logging.info(f"Min: {clean_stats['min']:.2f}")
+    logging.info(f"Max: {clean_stats['max']:.2f}")
+    logging.info(f"Mean: {clean_stats['mean']:.2f}")
+    
     # Derive features
     X, features = derive_features(df_sales, df_stores, is_prediction=False)
     y = df_sales['revenue'].values
