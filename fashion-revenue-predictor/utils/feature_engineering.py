@@ -22,119 +22,60 @@ logging.basicConfig(
 
 def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_sales: pd.DataFrame = None, is_prediction: bool = False) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Derive features from sales and stores data.
+    Derive features for model training or prediction.
     
     Args:
-        df_sales: DataFrame with sales data
-        df_stores: DataFrame with store information
-        historical_sales: DataFrame with historical sales data for lag features (optional)
-        is_prediction: Whether this is being called for prediction (single row) or training
+        df_sales: Sales DataFrame
+        df_stores: Stores DataFrame
+        historical_sales: Optional historical sales data for prediction
+        is_prediction: Whether this is for prediction (True) or training (False)
         
     Returns:
-        Tuple of (X: feature matrix, y: target variable)
+        Tuple of (feature DataFrame, list of feature names)
     """
-    # Create models directory if it doesn't exist
-    os.makedirs('models', exist_ok=True)
-    
     logging.info("Starting feature engineering...")
     logging.info(f"Input shapes - Sales: {df_sales.shape}, Stores: {df_stores.shape}")
     if historical_sales is not None:
         logging.info(f"Historical sales shape: {historical_sales.shape}")
     
-    # Ensure date is datetime
-    df_sales['date'] = pd.to_datetime(df_sales['date'])
-    if historical_sales is not None:
-        historical_sales['date'] = pd.to_datetime(historical_sales['date'])
+    # Ensure consistent data types for categorical columns
+    categorical_cols = ['channel', 'region', 'city']
+    for col in categorical_cols:
+        if col in df_stores.columns:
+            df_stores[col] = df_stores[col].astype(str)
+        if col in df_sales.columns:
+            df_sales[col] = df_sales[col].astype(str)
+        if historical_sales is not None and col in historical_sales.columns:
+            historical_sales[col] = historical_sales[col].astype(str)
     
-    # Ensure store IDs are strings and validate
-    df_sales['store'] = df_sales['store'].astype(str)
-    df_stores['id'] = df_stores['id'].astype(str)
-    if historical_sales is not None:
-        historical_sales['store'] = historical_sales['store'].astype(str)
-    
-    # Log store IDs for debugging
-    logging.info(f"Sales store IDs: {df_sales['store'].unique()}")
-    logging.info(f"Stores IDs: {df_stores['id'].unique()}")
-    if historical_sales is not None:
-        logging.info(f"Historical sales store IDs: {historical_sales['store'].unique()}")
-    
-    # Validate required columns
-    required_sales_cols = ['store', 'date', 'qty_sold', 'revenue', 'disc_perc']
-    required_stores_cols = ['id', 'channel', 'city', 'region', 'store_area', 'is_online']
-    
-    missing_sales_cols = [col for col in required_sales_cols if col not in df_sales.columns]
-    missing_stores_cols = [col for col in required_stores_cols if col not in df_stores.columns]
-    
-    if missing_sales_cols:
-        raise ValueError(f"Missing required columns in sales data: {missing_sales_cols}")
-    if missing_stores_cols:
-        raise ValueError(f"Missing required columns in stores data: {missing_stores_cols}")
-    if historical_sales is not None:
-        missing_hist_cols = [col for col in required_sales_cols if col not in historical_sales.columns]
-        if missing_hist_cols:
-            raise ValueError(f"Missing required columns in historical sales data: {missing_hist_cols}")
-    
-    # Merge store data
-    df = pd.merge(df_sales, df_stores, left_on='store', right_on='id', how='left')
+    # Merge sales and store data
+    df = df_sales.merge(df_stores, left_on='store', right_on='id', how='left')
     logging.info(f"Merged data shape: {df.shape}")
-    
-    # Validate merge
-    if len(df) != len(df_sales):
-        logging.error(f"Merge resulted in different number of rows: {len(df)} vs {len(df_sales)}")
-        raise ValueError(f"Merge resulted in different number of rows: {len(df)} vs {len(df_sales)}")
-    
-    # Check for missing store data
-    missing_stores = df[df['channel'].isna()]['store'].unique()
-    if len(missing_stores) > 0:
-        logging.error(f"Missing store data for stores: {missing_stores}")
-        raise ValueError(f"Missing store data for stores: {missing_stores}")
-    
-    # Log column types after merge
     logging.info("Column types after merge:")
     logging.info(df.dtypes)
     
-    # Initialize feature list
     features = []
     
     # 1. Temporal Features
     logging.info("Generating temporal features...")
-    df['day_of_week'] = df['date'].dt.dayofweek
-    df['month'] = df['date'].dt.month
-    df['quarter'] = df['date'].dt.quarter
+    df['date'] = pd.to_datetime(df['date'])
     df['year'] = df['date'].dt.year
+    df['month'] = df['date'].dt.month
+    df['day'] = df['date'].dt.day
+    df['day_of_week'] = df['date'].dt.dayofweek
+    df['quarter'] = df['date'].dt.quarter
     df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-    df['is_month_start'] = df['date'].dt.is_month_start.astype(int)
-    df['is_month_end'] = df['date'].dt.is_month_end.astype(int)
-    df['lead_time_days'] = (df['date'] - pd.Timestamp.today()).dt.days
     
     # Add cyclical encoding for temporal features
     logging.info("Adding cyclical encoding for temporal features...")
-    
-    # Month cyclical encoding (12 months)
+    df['day_of_week_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+    df['day_of_week_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
     
-    # Day of week cyclical encoding (7 days)
-    df['day_of_week_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
-    df['day_of_week_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
-    
-    # Day of month cyclical encoding (assuming max 31 days)
-    df['day_of_month'] = df['date'].dt.day
-    df['day_of_month_sin'] = np.sin(2 * np.pi * df['day_of_month'] / 31)
-    df['day_of_month_cos'] = np.cos(2 * np.pi * df['day_of_month'] / 31)
-    
-    # Add interaction features for seasonality
-    df['month_weekend'] = df['month_sin'] * df['is_weekend']  # Weekend effect varies by month
-    df['month_day'] = df['month_sin'] * df['day_of_week_sin']  # Day effect varies by month
-    
-    # Update features list with new cyclical features
     features.extend([
-        'day_of_week', 'month', 'quarter', 'year', 'is_weekend', 
-        'is_month_start', 'is_month_end', 'lead_time_days',
-        'month_sin', 'month_cos',
-        'day_of_week_sin', 'day_of_week_cos',
-        'day_of_month_sin', 'day_of_month_cos',
-        'month_weekend', 'month_day'
+        'year', 'month', 'day', 'day_of_week', 'quarter', 'is_weekend',
+        'day_of_week_sin', 'day_of_week_cos', 'month_sin', 'month_cos'
     ])
     
     # 2. Store/Location Features
@@ -144,9 +85,9 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     if not is_prediction:
         # During training, get unique values from data
         all_categories = {
-            'channel': ['ONLINE', 'LFR_LIFESTYLE'],
-            'region': df['region'].unique().tolist(),
-            'city': df['city'].unique().tolist()
+            'channel': sorted(df['channel'].unique().tolist()),
+            'region': sorted(df['region'].unique().tolist()),
+            'city': sorted(df['city'].unique().tolist())
         }
         # Save categories for prediction
         with open('models/categories.json', 'w') as f:
@@ -174,9 +115,7 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     
     # 3. Discount Features
     logging.info("Generating discount features...")
-    # Use disc_perc directly
     df['discount_pct'] = df['disc_perc'].fillna(0)
-    # Ensure discount percentage is between 0 and 1
     df['discount_pct'] = df['discount_pct'].clip(0, 1)
     df['is_discounted'] = (df['discount_pct'] > 0).astype(int)
     
@@ -190,7 +129,6 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     df['discount_store_area_interaction'] = df['discount_pct'] * df['store_area_bucket']
     
     # 3. Region and quarter interaction using label encoding
-    # Create label encoded region
     if not is_prediction:
         region_encoder = LabelEncoder()
         df['region_encoded'] = region_encoder.fit_transform(df['region'])
@@ -208,8 +146,7 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     # Create region-quarter interaction
     df['region_quarter_interaction'] = df['region_encoded'] * df['quarter']
     
-    # 4. Polynomial interactions for top features (to be determined by SHAP)
-    # For now, we'll add polynomial interactions for discount_pct and store_area
+    # 4. Polynomial interactions
     df['discount_pct_squared'] = df['discount_pct'] ** 2
     df['store_area_squared'] = df['store_area'] ** 2
     
@@ -295,135 +232,71 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             for feat in store_month_features:
                 df[feat] = 0
     
-    # 5. Lightweight Lag Proxies
-    logging.info("Generating lightweight lag proxies...")
-    if not is_prediction:
-        # During training, calculate lag features
-        # Sort by store and date to ensure correct lag calculation
-        df = df.sort_values(['store', 'date'])
+    # 5. Rolling Statistics
+    logging.info("Generating rolling statistics...")
+    if historical_sales is not None:
+        # Calculate rolling statistics using historical data
+        historical_sales['date'] = pd.to_datetime(historical_sales['date'])
+        historical_sales = historical_sales.sort_values('date')
         
-        # Calculate lag features
-        df['lag_1'] = df.groupby('store')['revenue'].shift(1)
-        df['lag_7'] = df.groupby('store')['revenue'].shift(7)
-        
-        # Calculate rolling means
-        df['rolling_mean_7d'] = df.groupby('store')['revenue'].transform(
-            lambda x: x.rolling(7, min_periods=1).mean()
-        )
-        df['rolling_mean_30d'] = df.groupby('store')['revenue'].transform(
-            lambda x: x.rolling(30, min_periods=1).mean()
-        )
-        
-        # Add rolling statistical features
-        df['rolling_std_7d'] = df.groupby('store')['revenue'].transform(
-            lambda x: x.rolling(7, min_periods=1).std()
-        )
-        df['rolling_std_30d'] = df.groupby('store')['revenue'].transform(
-            lambda x: x.rolling(30, min_periods=1).std()
-        )
-        df['rolling_min_7d'] = df.groupby('store')['revenue'].transform(
-            lambda x: x.rolling(7, min_periods=1).min()
-        )
-        df['rolling_max_7d'] = df.groupby('store')['revenue'].transform(
-            lambda x: x.rolling(7, min_periods=1).max()
-        )
-        df['rolling_skew_7d'] = df.groupby('store')['revenue'].transform(
-            lambda x: x.rolling(7, min_periods=1).skew()
-        )
-        
-        # Add lag features to feature list
-        features.extend([
-            'lag_1', 'lag_7', 
-            'rolling_mean_7d', 'rolling_mean_30d',
-            'rolling_std_7d', 'rolling_std_30d',
-            'rolling_min_7d', 'rolling_max_7d',
-            'rolling_skew_7d'
-        ])
-        
-        # Save lag parameters for prediction
-        lag_params = {
-            'lag_periods': [1, 7],
-            'rolling_windows': [7, 30]
-        }
-        with open('models/lag_params.json', 'w') as f:
-            json.dump(lag_params, f)
+        # Calculate rolling means and stds
+        for window in [7, 14, 30]:
+            rolling_mean = historical_sales['revenue'].rolling(window=window, min_periods=1).mean()
+            rolling_std = historical_sales['revenue'].rolling(window=window, min_periods=1).std()
+            
+            df[f'rolling_mean_{window}d'] = rolling_mean.iloc[-1]
+            df[f'rolling_std_{window}d'] = rolling_std.iloc[-1]
+            
+            features.extend([f'rolling_mean_{window}d', f'rolling_std_{window}d'])
     else:
-        # During prediction, use historical sales data if available
-        if historical_sales is not None:
-            # Combine historical and current data
-            combined_sales = pd.concat([historical_sales, df_sales])
-            combined_sales = combined_sales.sort_values(['store', 'date'])
-            
-            # Calculate lag features using combined data
-            df['lag_1'] = combined_sales.groupby('store')['revenue'].shift(1).iloc[-len(df):]
-            df['lag_7'] = combined_sales.groupby('store')['revenue'].shift(7).iloc[-len(df):]
-            
-            # Calculate rolling means using combined data
-            df['rolling_mean_7d'] = combined_sales.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(7, min_periods=1).mean()
-            ).iloc[-len(df):]
-            df['rolling_mean_30d'] = combined_sales.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(30, min_periods=1).mean()
-            ).iloc[-len(df):]
-            
-            # Calculate rolling statistical features using combined data
-            df['rolling_std_7d'] = combined_sales.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(7, min_periods=1).std()
-            ).iloc[-len(df):]
-            df['rolling_std_30d'] = combined_sales.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(30, min_periods=1).std()
-            ).iloc[-len(df):]
-            df['rolling_min_7d'] = combined_sales.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(7, min_periods=1).min()
-            ).iloc[-len(df):]
-            df['rolling_max_7d'] = combined_sales.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(7, min_periods=1).max()
-            ).iloc[-len(df):]
-            df['rolling_skew_7d'] = combined_sales.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(7, min_periods=1).skew()
-            ).iloc[-len(df):]
-        else:
-            # If no historical data available, use zeros
-            lag_features = [
-                'lag_1', 'lag_7', 
-                'rolling_mean_7d', 'rolling_mean_30d',
-                'rolling_std_7d', 'rolling_std_30d',
-                'rolling_min_7d', 'rolling_max_7d',
-                'rolling_skew_7d'
-            ]
-            for feature in lag_features:
-                df[feature] = 0
-        
-        # Add lag features to feature list
-        features.extend([
-            'lag_1', 'lag_7', 
-            'rolling_mean_7d', 'rolling_mean_30d',
-            'rolling_std_7d', 'rolling_std_30d',
-            'rolling_min_7d', 'rolling_max_7d',
-            'rolling_skew_7d'
-        ])
+        # During training, calculate rolling statistics
+        df = df.sort_values('date')
+        for window in [7, 14, 30]:
+            df[f'rolling_mean_{window}d'] = df.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(window=window, min_periods=1).mean()
+            )
+            df[f'rolling_std_{window}d'] = df.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(window=window, min_periods=1).std()
+            )
+            features.extend([f'rolling_mean_{window}d', f'rolling_std_{window}d'])
     
-    # Fill NaN values in lag features with 0
-    lag_features = [
-        'lag_1', 'lag_7', 
-        'rolling_mean_7d', 'rolling_mean_30d',
-        'rolling_std_7d', 'rolling_std_30d',
-        'rolling_min_7d', 'rolling_max_7d',
-        'rolling_skew_7d'
-    ]
-    df[lag_features] = df[lag_features].fillna(0)
+    # 6. Lead Time Features
+    logging.info("Generating lead time features...")
+    if historical_sales is not None:
+        # Calculate lead time using historical data
+        last_date = historical_sales['date'].max()
+        df['lead_time_days'] = (df['date'] - last_date).dt.days
+    else:
+        # During training, calculate lead time from previous day
+        df['lead_time_days'] = df.groupby('store')['date'].diff().dt.days
+        df['lead_time_days'] = df['lead_time_days'].fillna(0)
     
-    # Select features and handle missing values
+    features.append('lead_time_days')
+    
+    # Ensure all features are present and in the correct order
+    if is_prediction:
+        try:
+            with open('models/brandA_feature_names.json', 'r') as f:
+                saved_features = json.load(f)
+            
+            # Ensure all required features are present
+            for feature_set in saved_features.values():
+                missing_features = set(feature_set) - set(df.columns)
+                if missing_features:
+                    for feat in missing_features:
+                        df[feat] = 0  # Add missing features with zeros
+        except FileNotFoundError:
+            raise ValueError("Feature names file not found. Please train the model first.")
+    
+    # Select final features
     logging.info("Selecting final features...")
-    X = df[features].copy()
-    X = X.fillna(0)  # Fill any remaining missing values with 0
+    if is_prediction:
+        # During prediction, use all saved feature sets
+        X = df[saved_features['all_features']]
+    else:
+        # During training, use all generated features
+        X = df[features]
     
-    # Validate final dimensions
-    if len(X) != len(df_sales):
-        logging.error(f"Final feature matrix has different number of rows: {len(X)} vs {len(df_sales)}")
-        raise ValueError(f"Final feature matrix has different number of rows: {len(X)} vs {len(df_sales)}")
-    
-    # Log final feature matrix info
     logging.info(f"Final feature count: {len(features)}")
     logging.info(f"Final feature matrix shape: {X.shape}")
     logging.info("Feature engineering complete.")
