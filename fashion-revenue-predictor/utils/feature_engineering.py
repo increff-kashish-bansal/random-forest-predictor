@@ -9,6 +9,7 @@ from pathlib import Path
 import os
 from datetime import datetime, timedelta
 import pickle
+from scipy.stats import boxcox
 
 # Configure logging
 logging.basicConfig(
@@ -19,6 +20,75 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+def apply_cluster_specific_transforms(df: pd.DataFrame, cluster: str) -> pd.DataFrame:
+    """
+    Apply cluster-specific feature transformations.
+    
+    Args:
+        df: DataFrame containing features
+        cluster: Store cluster identifier
+        
+    Returns:
+        DataFrame with transformed features
+    """
+    df = df.copy()
+    
+    # Define cluster-specific transformations
+    if cluster == 'PREMIUM_OFFLINE':
+        # Box-Cox transform for revenue and quantity
+        if 'revenue' in df.columns:
+            df['revenue'], lambda_revenue = boxcox(df['revenue'] + 1)
+        if 'qty_sold' in df.columns:
+            df['qty_sold'], lambda_qty = boxcox(df['qty_sold'] + 1)
+            
+        # Target encoding for discounts
+        if 'discount_pct' in df.columns:
+            discount_means = df.groupby('discount_pct')['revenue'].transform('mean')
+            df['discount_target_encoded'] = discount_means
+            
+    elif cluster == 'ONLINE':
+        # Log transform with offset for online sales
+        if 'revenue' in df.columns:
+            df['revenue'] = np.log1p(df['revenue'] + 100)  # Add offset for online sales
+        if 'qty_sold' in df.columns:
+            df['qty_sold'] = np.log1p(df['qty_sold'] + 10)
+            
+        # Discount interaction features
+        if 'discount_pct' in df.columns:
+            df['discount_squared'] = df['discount_pct'] ** 2
+            df['discount_cubed'] = df['discount_pct'] ** 3
+            
+    elif cluster == 'SEASONAL_SPECIALIST':
+        # Seasonal-specific transformations
+        if 'revenue' in df.columns:
+            # Use Box-Cox for revenue
+            df['revenue'], lambda_revenue = boxcox(df['revenue'] + 1)
+            
+        # Create seasonal discount features
+        if 'discount_pct' in df.columns and 'month' in df.columns:
+            df['seasonal_discount'] = df['discount_pct'] * np.sin(2 * np.pi * df['month'] / 12)
+            
+    elif cluster == 'HOLIDAY_SPECIALIST':
+        # Holiday-specific transformations
+        if 'revenue' in df.columns:
+            # Use log transform for holiday stores
+            df['revenue'] = np.log1p(df['revenue'])
+            
+        # Create holiday-specific discount features
+        if 'discount_pct' in df.columns:
+            holiday_months = [10, 11, 12, 1, 2]  # October to February
+            df['is_holiday_month'] = df['month'].isin(holiday_months).astype(int)
+            df['holiday_discount'] = df['discount_pct'] * df['is_holiday_month']
+            
+    else:  # Default for other clusters
+        # Standard log transform
+        if 'revenue' in df.columns:
+            df['revenue'] = np.log1p(df['revenue'])
+        if 'qty_sold' in df.columns:
+            df['qty_sold'] = np.log1p(df['qty_sold'])
+    
+    return df
 
 def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_sales: pd.DataFrame = None, is_prediction: bool = False) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -55,6 +125,20 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     logging.info(df.dtypes)
     
     features = []
+    
+    # Apply cluster-specific transformations
+    logging.info("Applying cluster-specific transformations...")
+    if 'store_cluster' in df.columns:
+        # Group by cluster and apply transformations
+        transformed_dfs = []
+        for cluster in df['store_cluster'].unique():
+            cluster_df = df[df['store_cluster'] == cluster].copy()
+            transformed_df = apply_cluster_specific_transforms(cluster_df, cluster)
+            transformed_dfs.append(transformed_df)
+        
+        # Combine transformed DataFrames
+        df = pd.concat(transformed_dfs, axis=0)
+        df = df.sort_index()  # Restore original order
     
     # 1. Temporal Features
     logging.info("Generating temporal features...")

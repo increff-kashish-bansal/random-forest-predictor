@@ -5,6 +5,7 @@ import pandas as pd
 import shap
 from typing import Dict, List, Tuple
 from scipy.special import inv_boxcox
+from utils.feature_engineering import apply_cluster_specific_transforms
 
 def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     """
@@ -23,6 +24,18 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     models = joblib.load('models/brandA_models.pkl')
     with open('models/brandA_feature_names.json', 'r') as f:
         feature_names = json.load(f)
+    
+    # Apply cluster-specific transformations
+    if 'store_cluster' in df_X.columns:
+        transformed_dfs = []
+        for cluster in df_X['store_cluster'].unique():
+            cluster_df = df_X[df_X['store_cluster'] == cluster].copy()
+            transformed_df = apply_cluster_specific_transforms(cluster_df, cluster)
+            transformed_dfs.append(transformed_df)
+        
+        # Combine transformed DataFrames
+        df_X = pd.concat(transformed_dfs, axis=0)
+        df_X = df_X.sort_index()  # Restore original order
     
     # Get predictions from each model using appropriate feature sets
     # 1. Median predictions (log scale)
