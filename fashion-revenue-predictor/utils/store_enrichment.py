@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple
 import requests
-from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 import logging
 import json
@@ -17,6 +17,28 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
+def add_gaussian_noise(X: np.ndarray, noise_level: float = 0.05) -> np.ndarray:
+    """
+    Add Gaussian noise to numeric features for data augmentation.
+    
+    Args:
+        X: Feature matrix
+        noise_level: Standard deviation of noise as a fraction of feature std
+        
+    Returns:
+        Feature matrix with added noise
+    """
+    # Calculate feature-wise standard deviations
+    feature_stds = np.std(X, axis=0)
+    
+    # Generate noise matrix
+    noise = np.random.normal(0, noise_level * feature_stds, X.shape)
+    
+    # Add noise to features
+    X_noisy = X + noise
+    
+    return X_noisy
 
 def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> pd.DataFrame:
     """
@@ -120,7 +142,7 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
         except Exception:
             df['store_area_bucket'] = 2  # Default to middle bucket if binning fails
     
-    # 4. Create store clusters using multiple features
+    # 4. Create store clusters using GMM for soft clustering
     if not is_prediction:
         # During training, perform clustering
         
@@ -230,12 +252,38 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
         optimal_clusters = find_optimal_clusters(X_cluster_pca)
         logging.info(f"Optimal number of clusters determined: {optimal_clusters}")
         
-        kmeans = KMeans(n_clusters=optimal_clusters, random_state=42, n_init=10)
-        df['store_cluster'] = kmeans.fit_predict(X_cluster_pca)
+        # Use GMM instead of KMeans for soft clustering
+        gmm = GaussianMixture(
+            n_components=optimal_clusters,
+            covariance_type='full',
+            random_state=42,
+            n_init=10
+        )
+        
+        # Fit GMM and get cluster probabilities
+        cluster_probs = gmm.fit_predict_proba(X_cluster_pca)
+        
+        # Add cluster probabilities as features
+        for i in range(optimal_clusters):
+            df[f'cluster_{i}_prob'] = cluster_probs[:, i]
+        
+        # Get the most likely cluster for each store
+        df['store_cluster'] = np.argmax(cluster_probs, axis=1)
+        
+        # Add noise to numeric features for data augmentation
+        X_cluster_noisy = add_gaussian_noise(X_cluster, noise_level=0.05)
+        X_cluster_pca_noisy = pca.transform(X_cluster_noisy)
+        cluster_probs_noisy = gmm.predict_proba(X_cluster_pca_noisy)
+        
+        # Add noisy cluster probabilities
+        for i in range(optimal_clusters):
+            df[f'cluster_{i}_prob_noisy'] = cluster_probs_noisy[:, i]
         
         # Save cluster information for prediction
         cluster_info = {
-            'cluster_centers': [center.tolist() for center in kmeans.cluster_centers_],
+            'gmm_means': gmm.means_.tolist(),
+            'gmm_covariances': [cov.tolist() for cov in gmm.covariances_],
+            'gmm_weights': gmm.weights_.tolist(),
             'feature_means': [float(x) for x in scaler.mean_],
             'feature_scales': [float(x) for x in scaler.scale_],
             'pca_components': pca.components_.tolist(),
@@ -246,7 +294,7 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
         with open('models/store_clusters.json', 'w') as f:
             json.dump(cluster_info, f)
     else:
-        # During prediction, use nearest cluster
+        # During prediction, use GMM probabilities
         try:
             with open('models/store_clusters.json', 'r') as f:
                 cluster_info = json.load(f)
@@ -260,12 +308,30 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
             pca_mean = np.array(cluster_info['pca_mean'])
             X_cluster_pca = np.dot(X_cluster - pca_mean, pca_components.T)
             
-            # Find nearest cluster center
-            centers = np.array(cluster_info['cluster_centers'])
-            if len(X_cluster_pca.shape) == 1:
-                X_cluster_pca = X_cluster_pca.reshape(1, -1)
-            distances = np.array([np.linalg.norm(X_cluster_pca - center, axis=1) for center in centers])
-            df['store_cluster'] = np.argmin(distances, axis=0)
+            # Calculate GMM probabilities
+            gmm_means = np.array(cluster_info['gmm_means'])
+            gmm_covariances = np.array(cluster_info['gmm_covariances'])
+            gmm_weights = np.array(cluster_info['gmm_weights'])
+            
+            # Calculate cluster probabilities
+            cluster_probs = np.zeros((len(X_cluster_pca), len(gmm_means)))
+            for i in range(len(gmm_means)):
+                # Calculate multivariate normal probability
+                diff = X_cluster_pca - gmm_means[i]
+                inv_cov = np.linalg.inv(gmm_covariances[i])
+                exponent = -0.5 * np.sum(diff.dot(inv_cov) * diff, axis=1)
+                cluster_probs[:, i] = gmm_weights[i] * np.exp(exponent)
+            
+            # Normalize probabilities
+            cluster_probs = cluster_probs / cluster_probs.sum(axis=1, keepdims=True)
+            
+            # Add cluster probabilities as features
+            for i in range(len(gmm_means)):
+                df[f'cluster_{i}_prob'] = cluster_probs[:, i]
+            
+            # Get the most likely cluster
+            df['store_cluster'] = np.argmax(cluster_probs, axis=1)
+            
         except FileNotFoundError:
             # If no cluster info available, use simple categorization
             df['store_cluster'] = pd.cut(
@@ -336,7 +402,7 @@ def get_store_features(df_stores: pd.DataFrame) -> List[str]:
 
 def find_optimal_clusters(X: np.ndarray, max_clusters: int = 10) -> int:
     """
-    Find optimal number of clusters using elbow method and silhouette score.
+    Find optimal number of clusters using BIC score for GMM.
     
     Args:
         X: Feature matrix
@@ -345,32 +411,25 @@ def find_optimal_clusters(X: np.ndarray, max_clusters: int = 10) -> int:
     Returns:
         Optimal number of clusters
     """
-    # Calculate inertia and silhouette scores for different k values
-    inertias = []
-    silhouette_scores = []
+    # Calculate BIC scores for different k values
+    bic_scores = []
     k_values = range(2, min(max_clusters + 1, len(X)))
     
     for k in k_values:
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        kmeans.fit(X)
-        inertias.append(kmeans.inertia_)
-        
-        # Calculate silhouette score
-        if len(X) > k:  # Silhouette score requires more samples than clusters
-            labels = kmeans.labels_
-            silhouette_scores.append(silhouette_score(X, labels))
+        gmm = GaussianMixture(
+            n_components=k,
+            covariance_type='full',
+            random_state=42,
+            n_init=10
+        )
+        gmm.fit(X)
+        bic_scores.append(gmm.bic(X))
     
-    # Find elbow point using second derivative
-    if len(inertias) > 2:
-        # Calculate second derivative of inertia
-        second_derivative = np.diff(np.diff(inertias))
-        elbow_k = np.argmax(second_derivative) + 2  # +2 because we lost 2 points in diff
-        
-        # Find best silhouette score
-        best_silhouette_k = k_values[np.argmax(silhouette_scores)]
-        
-        # Use the average of both methods, rounded to nearest integer
-        optimal_k = int(np.round((elbow_k + best_silhouette_k) / 2))
+    # Find the elbow point in BIC scores
+    if len(bic_scores) > 2:
+        # Calculate second derivative of BIC scores
+        second_derivative = np.diff(np.diff(bic_scores))
+        optimal_k = np.argmax(second_derivative) + 2  # +2 because we lost 2 points in diff
         
         # Ensure optimal_k is within reasonable bounds
         optimal_k = max(2, min(optimal_k, max_clusters))
