@@ -360,25 +360,26 @@ elif page == "Predict":
                 store_row = st.session_state.processed_stores[st.session_state.processed_stores['id'] == store_id].copy()
                 store_row['store_area'] = store_area  # Update with user input
                 
-                # Generate features
-                X_pred, features = derive_features(synthetic_sales, store_row, is_prediction=True)
-                
+                # Get recent historical sales for the store (e.g., last 60 days before the prediction date)
+                historical_sales = st.session_state.processed_sales[
+                    (st.session_state.processed_sales['store'] == store_id) &
+                    (st.session_state.processed_sales['date'] < pd.Timestamp(future_date))
+                ].sort_values('date').tail(60)
+
+                # Generate features using historical sales
+                X_pred, features = derive_features(synthetic_sales, store_row, historical_sales=historical_sales, is_prediction=True)
                 # Fill any remaining NaN values with 0
                 X_pred = X_pred.fillna(0)
-                
-                # Load required features
-                with open('models/brandA_features.json', 'r') as f:
-                    required_features = json.load(f)
-                
-                # Check for missing features
+                # Load model feature names
+                with open('models/brandA_feature_names.json', 'r') as f:
+                    feature_names = json.load(f)
+                required_features = feature_names['all_features']
+                # Add any missing features with zeros and reorder columns
                 missing_features = set(required_features) - set(X_pred.columns)
                 if missing_features:
-                    st.error(f"Missing features: {missing_features}")
-                    st.stop()
-                
-                # Select features in correct order
-                X_pred = X_pred[required_features]
-                
+                    for feat in missing_features:
+                        X_pred[feat] = 0
+                X_pred = X_pred.reindex(columns=required_features, fill_value=0)
                 # Make prediction
                 results = predict_and_explain(X_pred)
                 

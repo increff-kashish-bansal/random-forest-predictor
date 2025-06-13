@@ -426,6 +426,11 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         features.extend(store_stats_features)
         features.extend(store_month_features)
         
+        # Ensure 'store' columns are of the same type (string) before merging
+        df['store'] = df['store'].astype(str)
+        store_stats['store'] = store_stats['store'].astype(str)
+        store_month_stats['store'] = store_month_stats['store'].astype(str)
+        store_seasonal_index['store'] = store_seasonal_index['store'].astype(str)
         # Merge store stats
         df = df.merge(store_stats, on=['store', 'date'], how='left')
         df = df.merge(store_month_stats, on=['store', 'month', 'date'], how='left')
@@ -545,20 +550,11 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             store_month_stats = pd.read_json('models/store_month_stats.json')
             store_seasonal_index = pd.read_json('models/store_seasonal_index.json')
             
-            # Ensure store IDs are strings and convert dates
+            # Ensure 'store' columns are of the same type (string) before merging
+            df['store'] = df['store'].astype(str)
             store_stats['store'] = store_stats['store'].astype(str)
-            store_stats['date'] = pd.to_datetime(store_stats['date'])
             store_month_stats['store'] = store_month_stats['store'].astype(str)
-            store_month_stats['date'] = pd.to_datetime(store_month_stats['date'])
             store_seasonal_index['store'] = store_seasonal_index['store'].astype(str)
-            store_seasonal_index['date'] = pd.to_datetime(store_seasonal_index['date'])
-            
-            # Add store stats to features
-            store_stats_features = ['revenue_median', 'revenue_std']
-            store_month_features = ['store_month_revenue_median', 'store_month_revenue_std']
-            features.extend(store_stats_features)
-            features.extend(store_month_features)
-            
             # Merge store stats
             df = df.merge(store_stats, on=['store', 'date'], how='left')
             df = df.merge(store_month_stats, on=['store', 'month', 'date'], how='left')
@@ -636,6 +632,20 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     
     # Add interaction features
     logging.info("Generating interaction features...")
+    
+    # Ensure lag features exist in df; if not, add them with zeros
+    for lag in [1, 3, 7, 14, 30]:
+        lag_col = f'revenue_lag_{lag}'
+        if lag_col not in df.columns:
+            df[lag_col] = 0
+    # Also ensure diff features exist
+    diff_features = [
+        'revenue_lag_diff_1_3', 'revenue_lag_diff_3_7',
+        'revenue_lag_diff_7_14', 'revenue_lag_diff_14_30'
+    ]
+    for feat in diff_features:
+        if feat not in df.columns:
+            df[feat] = 0
     
     # 1. Store Characteristics Interactions
     # Store area and city interaction (captures premium locations)
@@ -788,26 +798,22 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     
     features.append('lead_time_days')
     
-    # Ensure all features are present and in the correct order
     if is_prediction:
         try:
             with open('models/brandA_feature_names.json', 'r') as f:
                 saved_features = json.load(f)
-            
-            # Ensure all required features are present
-            for feature_set in saved_features.values():
-                missing_features = set(feature_set) - set(df.columns)
-                if missing_features:
-                    for feat in missing_features:
-                        df[feat] = 0  # Add missing features with zeros
         except FileNotFoundError:
             raise ValueError("Feature names file not found. Please train the model first.")
-    
-    # Select final features
-    logging.info("Selecting final features...")
-    if is_prediction:
-        # During prediction, use all saved feature sets
-        X = df[saved_features['all_features']]
+        # Ensure all required features in 'all_features' are present immediately before feature selection
+        all_features = saved_features.get('all_features', [])
+        missing_features = set(all_features) - set(df.columns)
+        if missing_features:
+            print("DEBUG: Missing features before selection:", missing_features)
+            print("DEBUG: DataFrame columns:", list(df.columns))
+            for feat in missing_features:
+                df[feat] = 0  # Add missing features with zeros
+        # Reorder columns to match all_features
+        X = df.reindex(columns=all_features, fill_value=0)
     else:
         # During training, use all generated features
         X = df[features]

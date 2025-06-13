@@ -27,6 +27,15 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     with open('models/brandA_feature_names.json', 'r') as f:
         feature_names = json.load(f)
     
+    # Debug: Print input features
+    numeric_X = df_X[feature_names['all_features']].apply(pd.to_numeric, errors='coerce')
+    print("DEBUG: Input features to model (first row):")
+    print(df_X[feature_names['all_features']].iloc[0])
+    print("Any NaN in X_pred:", numeric_X.isna().any().any())
+    print("Any inf in X_pred:", numeric_X.replace([np.inf, -np.inf], np.nan).isna().any().any())
+    print("Max value in X_pred:", numeric_X.max().max())
+    print("Min value in X_pred:", numeric_X.min().min())
+    
     # Apply cluster-specific transformations
     if 'store_cluster' in df_X.columns:
         transformed_dfs = []
@@ -41,7 +50,8 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     
     # Get predictions from each model using appropriate feature sets
     # 1. Median predictions (log scale)
-    median_pred = np.expm1(models['median'].predict(df_X[feature_names['all_features']]))
+    median_raw = models['median'].predict(df_X[feature_names['all_features']])
+    print("DEBUG: Raw median model output:", median_raw)
     
     # 2. Lower tail predictions (residuals)
     lower_residuals = models['lower'].predict(df_X[feature_names['lower_features']])
@@ -49,8 +59,15 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     # 3. Upper tail predictions (residuals)
     upper_residuals = models['upper'].predict(df_X[feature_names['upper_features']])
     
+    # Sanity check: Clip raw outputs to reasonable range before expm1
+    median_raw = np.clip(median_raw, -10, 20)
+    lower_residuals = np.clip(lower_residuals, 0, 1e6)
+    upper_residuals = np.clip(upper_residuals, 0, 1e6)
+    
+    median_pred = np.expm1(median_raw)
+    
     # Calculate initial prediction intervals
-    p10 = median_pred - lower_residuals
+    p10 = np.maximum(median_pred - lower_residuals, 0)  # Ensure non-negative
     p50 = median_pred
     p90 = median_pred + upper_residuals
     
@@ -74,6 +91,12 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
         
         # Apply calibration to new predictions
         p10, p50, p90 = calibrator.calibrate_predictions(p10, p50, p90)
+        
+        # Final check to ensure non-negative values and proper ordering
+        p10 = np.maximum(p10, 0)  # Ensure non-negative
+        preds = np.vstack([p10, p50, p90])
+        preds_sorted = np.sort(preds, axis=0)
+        p10, p50, p90 = preds_sorted[0], preds_sorted[1], preds_sorted[2]
     except FileNotFoundError:
         logging.warning("Historical predictions not found, skipping calibration")
     
@@ -90,9 +113,7 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     top_5_features = list(sorted_importance.items())[:5]
     
     # After all calibration and sorting, invert log1p transformation for all predictions
-    p10 = np.expm1(p10)
-    p50 = np.expm1(p50)
-    p90 = np.expm1(p90)
+    print("DEBUG: Final predictions (p10, p50, p90):", p10, p50, p90)
     
     return {
         'p10': p10,
