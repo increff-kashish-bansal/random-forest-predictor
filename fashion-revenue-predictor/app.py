@@ -9,6 +9,7 @@ from train_model import train_model
 from predictor import predict_and_explain
 import logging
 from datetime import datetime
+import numpy as np
 
 # Page config
 st.set_page_config(
@@ -124,7 +125,22 @@ if page == "Upload":
                 }).reset_index()
                 
                 # Calculate discount percentage
-                df_sales['disc_perc'] = df_sales['disc_value'] / (df_sales['revenue'] + df_sales['disc_value'])
+                # Ensure we don't divide by zero and handle negative values
+                df_sales['disc_perc'] = np.where(
+                    (df_sales['revenue'] + df_sales['disc_value']) > 0,
+                    df_sales['disc_value'] / (df_sales['revenue'] + df_sales['disc_value']),
+                    0
+                )
+                
+                # Ensure discount percentage is between 0 and 1
+                df_sales['disc_perc'] = df_sales['disc_perc'].clip(0, 1)
+                
+                # Log discount statistics for debugging
+                st.write("Discount Statistics:")
+                st.write(f"- Min discount: {df_sales['disc_perc'].min():.2%}")
+                st.write(f"- Max discount: {df_sales['disc_perc'].max():.2%}")
+                st.write(f"- Mean discount: {df_sales['disc_perc'].mean():.2%}")
+                st.write(f"- Number of discounted sales: {len(df_sales[df_sales['disc_perc'] > 0])}")
                 
                 # Store processed data in session state
                 st.session_state['processed_sales'] = df_sales
@@ -292,7 +308,7 @@ elif page == "Predict":
                     same_month_metrics = same_month_data.groupby('year').agg({
                         'revenue': ['sum', 'mean'],
                         'qty_sold': ['sum', 'mean'],
-                        'disc_perc': 'mean'
+                        'disc_perc': ['mean', 'count']  # Add count to verify data points
                     }).round(2)
                     
                     # Display metrics in columns
@@ -316,10 +332,17 @@ elif page == "Predict":
                                 "Avg Daily Qty",
                                 f"{metrics[('qty_sold', 'mean')]:,.0f}"
                             )
-                            st.metric(
-                                "Avg Discount",
-                                f"{metrics[('disc_perc', 'mean')]*100:.1f}%"
-                            )
+                            # Only show discount if we have data points
+                            if metrics[('disc_perc', 'count')] > 0:
+                                st.metric(
+                                    "Avg Discount",
+                                    f"{metrics[('disc_perc', 'mean')]*100:.1f}%"
+                                )
+                            else:
+                                st.metric(
+                                    "Avg Discount",
+                                    "N/A"
+                                )
                 
                 st.markdown("---")
                 
@@ -335,7 +358,7 @@ elif page == "Predict":
                     same_day_metrics = same_day_data.groupby('year').agg({
                         'revenue': 'first',
                         'qty_sold': 'first',
-                        'disc_perc': 'first'
+                        'disc_perc': ['first', 'count']  # Add count to verify data points
                     }).round(2)
                     
                     # Display metrics in columns
@@ -345,16 +368,23 @@ elif page == "Predict":
                             st.markdown(f"**{year}**")
                             st.metric(
                                 "Revenue",
-                                f"₹{metrics['revenue']:,.2f}"
+                                f"₹{metrics[('revenue', 'first')]:,.2f}"
                             )
                             st.metric(
                                 "Qty Sold",
-                                f"{metrics['qty_sold']:,.0f}"
+                                f"{metrics[('qty_sold', 'first')]:,.0f}"
                             )
-                            st.metric(
-                                "Discount",
-                                f"{metrics['disc_perc']*100:.1f}%"
-                            )
+                            # Only show discount if we have data points
+                            if metrics[('disc_perc', 'count')] > 0:
+                                st.metric(
+                                    "Discount",
+                                    f"{metrics[('disc_perc', 'first')]*100:.1f}%"
+                                )
+                            else:
+                                st.metric(
+                                    "Discount",
+                                    "N/A"
+                                )
                 
                 st.markdown("---")
                 
@@ -363,7 +393,7 @@ elif page == "Predict":
                 yearly_avg = historical_data.groupby('year').agg({
                     'revenue': ['sum', 'mean'],
                     'qty_sold': ['sum', 'mean'],
-                    'disc_perc': 'mean'
+                    'disc_perc': ['mean', 'count']  # Add count to verify data points
                 }).round(2)
                 
                 if not yearly_avg.empty:
@@ -388,10 +418,17 @@ elif page == "Predict":
                                 "Avg Daily Qty",
                                 f"{metrics[('qty_sold', 'mean')]:,.0f}"
                             )
-                            st.metric(
-                                "Avg Discount",
-                                f"{metrics[('disc_perc', 'mean')]*100:.1f}%"
-                            )
+                            # Only show discount if we have data points
+                            if metrics[('disc_perc', 'count')] > 0:
+                                st.metric(
+                                    "Avg Discount",
+                                    f"{metrics[('disc_perc', 'mean')]*100:.1f}%"
+                                )
+                            else:
+                                st.metric(
+                                    "Avg Discount",
+                                    "N/A"
+                                )
             except Exception as e:
                 st.error(f"Error during prediction: {str(e)}")
                 st.error("Full error details:")
