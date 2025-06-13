@@ -338,14 +338,11 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     df['discount_pct'] = df['discount_pct'].clip(0, 1)
     df['is_discounted'] = (df['discount_pct'] > 0).astype(int)
     
-    # Add discount per square foot feature with safeguards
-    df['store_area'] = df['store_area'].fillna(df['store_area'].median())
-    df['store_area'] = df['store_area'].replace(0, df['store_area'].median())  # Replace zeros with median
+    # Add discount per square foot feature
     df['discount_per_sqft'] = (df['discount_pct'] * df['revenue']) / df['store_area']
-    df['discount_per_sqft'] = df['discount_per_sqft'].clip(-1e6, 1e6)  # Clip extreme values
     features.append('discount_per_sqft')
     
-    # Add region × channel × month one-hot encoded features with safeguards
+    # Add region × channel × month one-hot encoded features
     logging.info("Adding region × channel × month interaction features...")
     region_channel_month = pd.get_dummies(
         df['region'].astype(str) + '_' + 
@@ -353,21 +350,17 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         df['month'].astype(str),
         prefix='rcm'
     )
-    # Ensure all values are finite
-    region_channel_month = region_channel_month.replace([np.inf, -np.inf], 0)
     df = pd.concat([df, region_channel_month], axis=1)
     features.extend(list(region_channel_month.columns))
     
-    # Add region_weekday_std with safeguards
+    # Add region_weekday_std: std dev of revenue for each region × weekday pair (past 4 weeks rolling)
     logging.info("Adding region weekday volatility features...")
     df['region_weekday_std'] = df.groupby(['region', 'day_of_week'])['revenue'].transform(
         lambda x: x.rolling(window=28, min_periods=1).std().shift(1)
     )
-    df['region_weekday_std'] = df['region_weekday_std'].fillna(0)  # Fill NaN with 0
-    df['region_weekday_std'] = df['region_weekday_std'].clip(-1e6, 1e6)  # Clip extreme values
     features.append('region_weekday_std')
     
-    # Add time_since_last_high_revenue with safeguards
+    # Add time_since_last_high_revenue: days since last revenue > 90th percentile per store
     logging.info("Adding time since last high revenue feature...")
     def time_since_last_high_revenue_transform(rev):
         pct90 = rev.expanding().quantile(0.9)
@@ -388,7 +381,6 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         return pd.Series(days_since, index=rev.index)
     
     df['time_since_last_high_revenue'] = df.groupby('store')['revenue'].transform(time_since_last_high_revenue_transform)
-    df['time_since_last_high_revenue'] = df['time_since_last_high_revenue'].clip(0, 365)  # Clip to max 1 year
     features.append('time_since_last_high_revenue')
     
     # 4. Historical Features
@@ -872,39 +864,16 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     df['revenue_lag_7_percentile'] = df.groupby('store')['revenue'].transform(lag_7_percentile_transform)
     features.append('revenue_lag_7_percentile')
     
-    # Add final data validation before returning
-    logging.info("Validating final feature matrix...")
-    X = df[features]
-    
-    # Replace any remaining infinite values with 0
-    X = X.replace([np.inf, -np.inf], 0)
-    
-    # Clip extreme values
-    for col in X.columns:
-        if X[col].dtypes in [np.float32, np.float64]:
-            X[col] = X[col].clip(-1e6, 1e6)
-    
-    # Fill any remaining NaN values with 0
-    X = X.fillna(0)
-    
-    # Ensure all features are present in prediction mode
-    if is_prediction:
-        try:
-            with open('models/brandA_feature_names.json', 'r') as f:
-                saved_features = json.load(f)
-            
-            # Ensure all required features are present
-            for feature_set in saved_features.values():
-                missing_features = set(feature_set) - set(X.columns)
-                if missing_features:
-                    for feat in missing_features:
-                        X[feat] = 0  # Add missing features with zeros
-                        features.append(feat)  # Add to feature list
-        except FileNotFoundError:
-            raise ValueError("Feature names file not found. Please train the model first.")
-    
-    logging.info(f"Final feature count: {len(features)}")
-    logging.info(f"Final feature matrix shape: {X.shape}")
-    logging.info("Feature engineering complete.")
+    # Clean feature matrix: replace inf/-inf with nan, then fillna(0)
+    if isinstance(X, pd.DataFrame):
+        bad_cols = X.columns[(X.isna() | np.isinf(X)).any()]
+        if len(bad_cols) > 0:
+            print("Columns with NaN or Inf:", bad_cols.tolist())
+        X = X.replace([np.inf, -np.inf], np.nan)
+        X = X.fillna(0)
+    else:
+        if np.isnan(X).sum() > 0 or np.isinf(X).sum() > 0:
+            print("Feature array contains NaN or Inf values.")
+        X = np.nan_to_num(X)
     
     return X, features
