@@ -247,7 +247,56 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     df['city_encoded'] = df['city'].map(city_target).fillna(0)
     df['region_encoded'] = df['region'].map(region_target).fillna(0)
     df['channel_encoded'] = df['channel'].map(channel_target).fillna(0)
-    features.extend(['city_encoded', 'region_encoded', 'channel_encoded'])
+    
+    # Create city and region tiers based on revenue metrics
+    if not is_prediction:
+        # During training, calculate tiers based on historical data
+        # City tiers based on average revenue
+        city_revenue = df.groupby('city')['revenue'].agg(['mean', 'std', 'count'])
+        city_revenue['score'] = (
+            city_revenue['mean'] * 0.6 +  # Revenue importance
+            city_revenue['std'] * 0.2 +   # Revenue stability
+            city_revenue['count'] * 0.2   # Data volume
+        )
+        city_tiers = pd.qcut(city_revenue['score'], q=4, labels=["D", "C", "B", "A"])
+        city_tier_map = city_tiers.to_dict()
+        
+        # Region tiers based on average revenue
+        region_revenue = df.groupby('region')['revenue'].agg(['mean', 'std', 'count'])
+        region_revenue['score'] = (
+            region_revenue['mean'] * 0.6 +  # Revenue importance
+            region_revenue['std'] * 0.2 +   # Revenue stability
+            region_revenue['count'] * 0.2   # Data volume
+        )
+        region_tiers = pd.qcut(region_revenue['score'], q=4, labels=["D", "C", "B", "A"])
+        region_tier_map = region_tiers.to_dict()
+        
+        # Save tier mappings for prediction
+        with open('models/city_tiers.json', 'w') as f:
+            json.dump(city_tier_map, f)
+        with open('models/region_tiers.json', 'w') as f:
+            json.dump(region_tier_map, f)
+    else:
+        # During prediction, load tier mappings
+        try:
+            with open('models/city_tiers.json', 'r') as f:
+                city_tier_map = json.load(f)
+            with open('models/region_tiers.json', 'r') as f:
+                region_tier_map = json.load(f)
+        except FileNotFoundError:
+            raise ValueError("Tier mapping files not found. Please train the model first.")
+    
+    # Apply tier mappings
+    df['city_tier'] = df['city'].map(city_tier_map).fillna('D')  # Default to lowest tier
+    df['region_tier'] = df['region'].map(region_tier_map).fillna('D')  # Default to lowest tier
+    
+    # Convert tiers to numeric values for modeling
+    tier_map = {"D": 0, "C": 1, "B": 2, "A": 3}
+    df['city_tier_encoded'] = df['city_tier'].map(tier_map)
+    df['region_tier_encoded'] = df['region_tier'].map(tier_map)
+    
+    # Add tier features to feature list
+    features.extend(['city_tier_encoded', 'region_tier_encoded'])
     
     # Store area features
     df['store_area'] = df['store_area'].fillna(df['store_area'].median())
@@ -271,9 +320,7 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             lambda x: pd.DataFrame({
                 'date': x['date'],  # Include date in the output
                 'revenue_median': x['revenue'].expanding().median(),  # Keep median instead of mean
-                'revenue_std': x['revenue'].expanding().std(),
-                'qty_sold_median': x['qty_sold'].expanding().median(),  # Keep median instead of mean
-                'qty_sold_std': x['qty_sold'].expanding().std()
+                'revenue_std': x['revenue'].expanding().std()
             })
         ).reset_index()
         
@@ -300,8 +347,7 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         store_seasonal_index.to_json('models/store_seasonal_index.json')
         
         # Add store stats to features
-        store_stats_features = ['revenue_median', 'revenue_std',
-                              'qty_sold_median', 'qty_sold_std']
+        store_stats_features = ['revenue_median', 'revenue_std']
         store_month_features = ['store_month_revenue_median', 'store_month_revenue_std']
         features.extend(store_stats_features)
         features.extend(store_month_features)
@@ -319,8 +365,21 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         # Add lag features (using only past data)
         for lag in [1, 3, 7, 14, 30]:
             df[f'revenue_lag_{lag}'] = df.groupby('store')['revenue'].shift(lag)
-            df[f'qty_sold_lag_{lag}'] = df.groupby('store')['qty_sold'].shift(lag)
-            features.extend([f'revenue_lag_{lag}', f'qty_sold_lag_{lag}'])
+            features.extend([f'revenue_lag_{lag}'])
+        
+        # Add lag-based difference features to capture trends
+        # Revenue differences
+        df['revenue_lag_diff_1_3'] = df['revenue_lag_1'] - df['revenue_lag_3']
+        df['revenue_lag_diff_3_7'] = df['revenue_lag_3'] - df['revenue_lag_7']
+        df['revenue_lag_diff_7_14'] = df['revenue_lag_7'] - df['revenue_lag_14']
+        df['revenue_lag_diff_14_30'] = df['revenue_lag_14'] - df['revenue_lag_30']
+        
+        # Add difference features to feature list
+        diff_features = [
+            'revenue_lag_diff_1_3', 'revenue_lag_diff_3_7',
+            'revenue_lag_diff_7_14', 'revenue_lag_diff_14_30'
+        ]
+        features.extend(diff_features)
         
         # Add rolling statistics (using only past data)
         for window in [7, 14, 30]:
@@ -332,6 +391,59 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
                 lambda x: x.rolling(window=window, min_periods=1).std().shift(1)
             )
             features.extend([f'revenue_rolling_mean_{window}d', f'revenue_rolling_std_{window}d'])
+        
+        # Add short-term stability features
+        logging.info("Generating short-term stability features...")
+        
+        # 1. Short-term rolling aggregates (last 3 days)
+        df['revenue_last_3_days'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.rolling(3, min_periods=1).mean().shift(1)
+        )
+        df['revenue_last_3_days_std'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.rolling(3, min_periods=1).std().shift(1)
+        )
+        
+        # 2. Weekday-specific features
+        df['weekday_avg'] = df.groupby('day_of_week')['revenue'].transform('mean')
+        df['weekday_std'] = df.groupby('day_of_week')['revenue'].transform('std')
+        
+        # 3. Store-specific weekday patterns
+        df['store_weekday_avg'] = df.groupby(['store', 'day_of_week'])['revenue'].transform(
+            lambda x: x.expanding().mean().shift(1)
+        )
+        df['store_weekday_std'] = df.groupby(['store', 'day_of_week'])['revenue'].transform(
+            lambda x: x.expanding().std().shift(1)
+        )
+        
+        # 4. Week-over-week changes
+        df['revenue_week_over_week'] = df.groupby(['store', 'day_of_week'])['revenue'].transform(
+            lambda x: x.pct_change(7)
+        )
+        
+        # 5. Day-over-day changes
+        df['revenue_day_over_day'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.pct_change(1)
+        )
+        
+        # 6. Volatility features
+        df['revenue_volatility_3d'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.rolling(3, min_periods=1).std().shift(1) / 
+                     x.rolling(3, min_periods=1).mean().shift(1)
+        )
+        
+        # Add stability features to feature list
+        stability_features = [
+            'revenue_last_3_days',
+            'revenue_last_3_days_std',
+            'weekday_avg',
+            'weekday_std',
+            'store_weekday_avg',
+            'store_weekday_std',
+            'revenue_week_over_week',
+            'revenue_day_over_day',
+            'revenue_volatility_3d'
+        ]
+        features.extend(stability_features)
         
     else:
         # During prediction, load store stats
@@ -349,8 +461,7 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             store_seasonal_index['date'] = pd.to_datetime(store_seasonal_index['date'])
             
             # Add store stats to features
-            store_stats_features = ['revenue_median', 'revenue_std',
-                                  'qty_sold_median', 'qty_sold_std']
+            store_stats_features = ['revenue_median', 'revenue_std']
             store_month_features = ['store_month_revenue_median', 'store_month_revenue_std']
             features.extend(store_stats_features)
             features.extend(store_month_features)
@@ -370,8 +481,21 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
                 historical_sales = historical_sales.sort_values(['store', 'date'])
                 for lag in [1, 3, 7, 14, 30]:
                     df[f'revenue_lag_{lag}'] = historical_sales.groupby('store')['revenue'].last()
-                    df[f'qty_sold_lag_{lag}'] = historical_sales.groupby('store')['qty_sold'].last()
-                    features.extend([f'revenue_lag_{lag}', f'qty_sold_lag_{lag}'])
+                    features.extend([f'revenue_lag_{lag}'])
+                
+                # Add lag-based difference features to capture trends
+                # Revenue differences
+                df['revenue_lag_diff_1_3'] = df['revenue_lag_1'] - df['revenue_lag_3']
+                df['revenue_lag_diff_3_7'] = df['revenue_lag_3'] - df['revenue_lag_7']
+                df['revenue_lag_diff_7_14'] = df['revenue_lag_7'] - df['revenue_lag_14']
+                df['revenue_lag_diff_14_30'] = df['revenue_lag_14'] - df['revenue_lag_30']
+                
+                # Add difference features to feature list
+                diff_features = [
+                    'revenue_lag_diff_1_3', 'revenue_lag_diff_3_7',
+                    'revenue_lag_diff_7_14', 'revenue_lag_diff_14_30'
+                ]
+                features.extend(diff_features)
                 
                 # Add rolling statistics from historical data
                 for window in [7, 14, 30]:
@@ -386,8 +510,7 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             
         except FileNotFoundError:
             # If no stats available, create empty stats
-            store_stats_features = ['revenue_median', 'revenue_std',
-                                  'qty_sold_median', 'qty_sold_std']
+            store_stats_features = ['revenue_median', 'revenue_std']
             store_month_features = ['store_month_revenue_median', 'store_month_revenue_std']
             features.extend(store_stats_features)
             features.extend(store_month_features)
@@ -399,8 +522,7 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             # Add empty lag features
             for lag in [1, 3, 7, 14, 30]:
                 df[f'revenue_lag_{lag}'] = 0
-                df[f'qty_sold_lag_{lag}'] = 0
-                features.extend([f'revenue_lag_{lag}', f'qty_sold_lag_{lag}'])
+                features.extend([f'revenue_lag_{lag}'])
             
             # Add empty rolling statistics
             for window in [7, 14, 30]:
@@ -416,7 +538,7 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             features.extend(['store_seasonal_index', 'region_seasonal_index'])
     
     # Fill NaN values in historical features with 0
-    historical_features = [f for f in features if any(x in f for x in ['mean', 'std', 'median', 'lag', 'rolling'])]
+    historical_features = [f for f in features if any(x in f for x in ['mean', 'std'])]
     df[historical_features] = df[historical_features].fillna(0)
     
     # Add interaction features
@@ -479,6 +601,68 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         'seasonal_premium_location'
     ]
     features.extend(interaction_features)
+    
+    # 6. SHAP-based feature re-addition with orthogonalization
+    logging.info("Re-adding top SHAP features with orthogonalization...")
+    
+    # Define high-importance features to re-add
+    high_importance_features = [
+        'store_area',
+        'revenue_rolling_mean_7d',
+        'revenue_rolling_std_7d'
+    ]
+    
+    # Orthogonalize features
+    for feat in high_importance_features:
+        if feat in df.columns:
+            # Mean-center the feature
+            df[f'{feat}_centered'] = df[feat] - df[feat].mean()
+            
+            # Create residualized version by removing linear correlation with other features
+            # Use a subset of key features for residualization
+            residualization_features = [
+                'store_area_bucket',
+                'city_tier_encoded',
+                'region_tier_encoded',
+                'discount_pct',
+                'month'
+            ]
+            
+            # Only use features that exist in the DataFrame
+            residualization_features = [f for f in residualization_features if f in df.columns]
+            
+            if residualization_features:
+                # Calculate residuals using linear regression
+                X_resid = df[residualization_features].copy()
+                y_resid = df[f'{feat}_centered'].copy()
+                
+                # Add constant for intercept
+                X_resid = pd.concat([pd.Series(1, index=X_resid.index, name='const'), X_resid], axis=1)
+                
+                # Calculate coefficients using normal equation
+                try:
+                    # Ensure all data is numeric and handle any missing values
+                    X_resid = X_resid.fillna(0)
+                    y_resid = y_resid.fillna(0)
+                    
+                    # Convert to numpy arrays for matrix operations
+                    X_np = X_resid.values
+                    y_np = y_resid.values
+                    
+                    # Calculate coefficients
+                    beta = np.linalg.inv(X_np.T @ X_np) @ X_np.T @ y_np
+                    
+                    # Calculate residuals
+                    df[f'{feat}_orthogonal'] = y_np - (X_np @ beta)
+                except np.linalg.LinAlgError:
+                    # If matrix is singular, use simple mean-centering
+                    df[f'{feat}_orthogonal'] = df[f'{feat}_centered']
+            else:
+                # If no residualization features available, use mean-centered version
+                df[f'{feat}_orthogonal'] = df[f'{feat}_centered']
+            
+            # Add orthogonalized feature to feature list
+            features.append(f'{feat}_orthogonal')
     
     # Remove old low-variance interactions
     old_interactions = [

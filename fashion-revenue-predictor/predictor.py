@@ -47,10 +47,23 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     # 3. Upper tail predictions (residuals)
     upper_residuals = models['upper'].predict(df_X[feature_names['upper_features']])
     
-    # Calculate prediction intervals
+    # Calculate initial prediction intervals
     p10 = median_pred - lower_residuals
     p50 = median_pred
     p90 = median_pred + upper_residuals
+    
+    # Apply quantile residual smoothing using rolling averages
+    # Convert to pandas Series for rolling operations
+    p10_series = pd.Series(p10)
+    p90_series = pd.Series(p90)
+    
+    # Apply rolling average with window=3 and min_periods=1
+    smoothed_p10 = p10_series.rolling(window=3, min_periods=1).mean()
+    smoothed_p90 = p90_series.rolling(window=3, min_periods=1).mean()
+    
+    # Convert back to numpy arrays
+    p10 = smoothed_p10.values
+    p90 = smoothed_p90.values
     
     # Calculate SHAP values using median model
     explainer = shap.TreeExplainer(models['median'])
