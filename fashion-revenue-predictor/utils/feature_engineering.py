@@ -174,47 +174,39 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             'city': sorted(df['city'].unique().tolist())
         }
         
-        # Calculate frequency encodings for cities and regions
-        city_freq = df['city'].value_counts(normalize=True)
-        region_freq = df['region'].value_counts(normalize=True)
+        # Calculate target encoding for cities, regions, and channels
+        city_target = df.groupby('city')['revenue'].transform('mean')
+        region_target = df.groupby('region')['revenue'].transform('mean')
+        channel_target = df.groupby('channel')['revenue'].transform('mean')
         
-        # Save categories and frequencies for prediction
+        # Save categories and target encodings for prediction
         with open('models/categories.json', 'w') as f:
             json.dump(all_categories, f)
-        with open('models/city_frequencies.json', 'w') as f:
-            json.dump(city_freq.to_dict(), f)
-        with open('models/region_frequencies.json', 'w') as f:
-            json.dump(region_freq.to_dict(), f)
+        with open('models/city_target_encoding.json', 'w') as f:
+            json.dump(city_target.to_dict(), f)
+        with open('models/region_target_encoding.json', 'w') as f:
+            json.dump(region_target.to_dict(), f)
+        with open('models/channel_target_encoding.json', 'w') as f:
+            json.dump(channel_target.to_dict(), f)
     else:
-        # During prediction, load categories and frequencies
+        # During prediction, load categories and target encodings
         try:
             with open('models/categories.json', 'r') as f:
                 all_categories = json.load(f)
-            with open('models/city_frequencies.json', 'r') as f:
-                city_freq = pd.Series(json.load(f))
-            with open('models/region_frequencies.json', 'r') as f:
-                region_freq = pd.Series(json.load(f))
+            with open('models/city_target_encoding.json', 'r') as f:
+                city_target = pd.Series(json.load(f))
+            with open('models/region_target_encoding.json', 'r') as f:
+                region_target = pd.Series(json.load(f))
+            with open('models/channel_target_encoding.json', 'r') as f:
+                channel_target = pd.Series(json.load(f))
         except FileNotFoundError:
-            raise ValueError("Categories or frequency files not found. Please train the model first.")
+            raise ValueError("Categories or target encoding files not found. Please train the model first.")
     
-    # Apply frequency encoding for cities and regions
-    df['city_frequency'] = df['city'].map(city_freq).fillna(0)
-    df['region_frequency'] = df['region'].map(region_freq).fillna(0)
-    features.extend(['city_frequency', 'region_frequency'])
-    
-    # One-hot encode categorical features with sparsity filtering
-    for col, possible_values in all_categories.items():
-        # Calculate frequency of each category
-        category_freq = df[col].value_counts(normalize=True)
-        
-        # Filter out categories that appear in less than 1% of data
-        valid_categories = category_freq[category_freq >= 0.01].index.tolist()
-        
-        # Create dummy variables only for valid categories
-        for value in valid_categories:
-            col_name = f"{col}_{value}"
-            df[col_name] = (df[col] == value).astype(int)
-            features.append(col_name)
+    # Apply target encoding for cities, regions, and channels
+    df['city_encoded'] = df['city'].map(city_target).fillna(0)
+    df['region_encoded'] = df['region'].map(region_target).fillna(0)
+    df['channel_encoded'] = df['channel'].map(channel_target).fillna(0)
+    features.extend(['city_encoded', 'region_encoded', 'channel_encoded'])
     
     # Store area features
     df['store_area'] = df['store_area'].fillna(df['store_area'].median())
@@ -361,27 +353,27 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     
     # 1. Store Characteristics Interactions
     # Store area and city interaction (captures premium locations)
-    df['store_area_city_interaction'] = df['store_area'] * df['city_frequency']
+    df['store_area_city_interaction'] = df['store_area'] * df['city_encoded']
     
     # Store area and region interaction (captures regional preferences)
-    df['store_area_region_interaction'] = df['store_area'] * df['region_frequency']
+    df['store_area_region_interaction'] = df['store_area'] * df['region_encoded']
     
     # Online presence and city interaction (captures digital adoption by city)
-    df['online_city_interaction'] = df['is_online'] * df['city_frequency']
+    df['online_city_interaction'] = df['is_online'] * df['city_encoded']
     
     # 2. Discount Strategy Interactions
     # Discount and store tier interaction (captures premium vs regular pricing)
     df['discount_store_tier_interaction'] = df['discount_pct'] * df['store_area_bucket']
     
     # Discount and region interaction (captures regional price sensitivity)
-    df['discount_region_interaction'] = df['discount_pct'] * df['region_frequency']
+    df['discount_region_interaction'] = df['discount_pct'] * df['region_encoded']
     
     # Discount and city interaction (captures city-specific price sensitivity)
-    df['discount_city_interaction'] = df['discount_pct'] * df['city_frequency']
+    df['discount_city_interaction'] = df['discount_pct'] * df['city_encoded']
     
     # 3. Temporal Interactions
     # Month and region interaction (captures seasonal patterns by region)
-    df['month_region_interaction'] = df['month'] * df['region_frequency']
+    df['month_region_interaction'] = df['month'] * df['region_encoded']
     
     # Month and store tier interaction (captures seasonal patterns by store type)
     df['month_store_tier_interaction'] = df['month'] * df['store_area_bucket']
