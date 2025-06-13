@@ -1042,4 +1042,18 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         df['revenue_rolling_mean_14d'] = df.apply(lambda row: get_rolling_mean(row, 'revenue', 14), axis=1)
         features.extend(['discount_rolling_mean_14d', 'revenue_rolling_mean_14d'])
     
+    if is_prediction:
+        # Drop/zero out lag-based and rolling features that leak short-term signals
+        lag_rolling_patterns = [
+            'revenue_lag_', 'revenue_rolling_', 'store_weekday_', 'revenue_week_over_week',
+            'revenue_day_over_day', 'revenue_last_3_days', 'revenue_volatility_3d',
+            'revenue_lag_diff_', 'revenue_lag_7_percentile', 'region_weekday_std',
+            'region_weekday_volatility', 'time_since_last_high_revenue', 'time_since_last_peak_revenue',
+            'demand_trend', 'revenue_median', 'revenue_std', 'store_month_revenue_median',
+            'store_month_revenue_std', 'same_dayofyear_avg_3y', 'same_dayofyear_delta_vs_month',
+            'discount_rolling_mean_14d', 'discount_rolling_std_14d', 'revenue_rolling_mean_90d'
+        ]
+        drop_cols = [col for col in X.columns if any(pat in col for pat in lag_rolling_patterns)]
+        X = X.drop(columns=drop_cols, errors='ignore')
+    
     return X, features

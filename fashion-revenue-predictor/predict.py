@@ -17,10 +17,10 @@ p10_calibrated, p50_calibrated, p90_calibrated = calibrator.calibrate_prediction
     p10, p50, p90
 )
 
-# Convert back to original scale
-p10_calibrated = np.expm1(p10_calibrated)
-p50_calibrated = np.expm1(p50_calibrated)
-p90_calibrated = np.expm1(p90_calibrated)
+# Convert back to original scale using relative modeling
+p10_calibrated = np.expm1(p10_calibrated) * avg_day_month_revenue
+p50_calibrated = np.expm1(p50_calibrated) * avg_day_month_revenue
+p90_calibrated = np.expm1(p90_calibrated) * avg_day_month_revenue
 
 # Create prediction result
 prediction = {

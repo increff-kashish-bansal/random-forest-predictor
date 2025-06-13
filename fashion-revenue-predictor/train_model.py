@@ -214,359 +214,357 @@ def train_model(df_sales, df_stores):
     logging.info(f"Max: {clean_stats['max']:.2f}")
     logging.info(f"Mean: {clean_stats['mean']:.2f}")
     
-    try:
-        # Transform target variable to log1p for all model training
-        y = np.log1p(df_sales['revenue'])
+    # Calculate avg_day_month_revenue for each row
+    df_sales['month'] = pd.to_datetime(df_sales['date']).dt.month
+    df_sales['day_of_week'] = pd.to_datetime(df_sales['date']).dt.dayofweek
+    avg_day_month = df_sales.groupby(['store', 'month', 'day_of_week'])['revenue'].transform('mean')
+    df_sales['avg_day_month_revenue'] = avg_day_month
+    # Relative log target
+    y = np.log1p(df_sales['revenue'] / df_sales['avg_day_month_revenue'])
 
-        # Derive features
-        logging.info("Deriving features...")
-        X, features = derive_features(df_sales, df_stores, is_prediction=False)
-        
-        logging.info(f"Feature matrix shape: {X.shape}")
-        logging.info(f"Number of features: {len(features)}")
-        
-        # Sort data by date
-        df_sales['date'] = pd.to_datetime(df_sales['date'])
-        date_order = df_sales['date'].values
-        sort_idx = np.argsort(date_order)
-        X = X.iloc[sort_idx]
-        y = y.iloc[sort_idx]
-        store_ids = df_sales['store'].values[sort_idx]
-        
-        # Calculate sample weights
-        sample_weights = calculate_sample_weights(df_sales.iloc[sort_idx])
-        logging.info("Sample weights calculated with log-based decay and day-of-week weighting")
+    # Derive features
+    logging.info("Deriving features...")
+    X, features = derive_features(df_sales, df_stores, is_prediction=False)
+    
+    logging.info(f"Feature matrix shape: {X.shape}")
+    logging.info(f"Number of features: {len(features)}")
+    
+    # Sort data by date
+    df_sales['date'] = pd.to_datetime(df_sales['date'])
+    date_order = df_sales['date'].values
+    sort_idx = np.argsort(date_order)
+    X = X.iloc[sort_idx]
+    y = y.iloc[sort_idx]
+    store_ids = df_sales['store'].values[sort_idx]
+    
+    # Calculate sample weights
+    sample_weights = calculate_sample_weights(df_sales.iloc[sort_idx])
+    logging.info("Sample weights calculated with log-based decay and day-of-week weighting")
 
-        # Common model parameters
-        model_params = {
-            'n_estimators': 100,  # Increased from 50 for better feature importance estimation
-            'max_depth': 8,
-            'min_samples_split': 5,
-            'min_samples_leaf': 2,
-            'random_state': 42,
-            'n_jobs': -1,
-            'verbose': 0
-        }
-        
-        # Apply iterative feature pruning
-        logging.info("\nStarting iterative feature pruning...")
-        best_model, selected_features, r2_scores = iterative_feature_pruning(
-            X=X,
-            y=y,
-            model_params=model_params,
-            n_iter=10
-        )
-        
-        logging.info(f"Selected {len(selected_features)} features after pruning")
-        
-        # Apply global SHAP-based feature selection
-        logging.info("\nApplying global SHAP-based feature selection...")
-        selected_features = select_features_by_global_shap(
-            X=X[selected_features],
-            y=y,
-            store_ids=store_ids,
-            n_features=25,  # Keep top 25 stable features
-            n_trees=100,
-            n_splits=5
-        )
-        logging.info(f"Selected {len(selected_features)} features after global SHAP analysis")
-        
-        # Train final models with selected features
-        models = {}
-        cv_scores = {model_type: [] for model_type in ['median', 'lower', 'upper']}
-        cv_metrics = []
-        
-        # Initialize GroupTimeSeriesSplit
-        n_splits = 5
-        gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
-        
-        # LightGBM default parameters with regularization and early stopping
-        lgb_base_params = {
-            'objective': 'quantile',
-            'metric': 'quantile',
-            'boosting_type': 'gbdt',
-            'num_leaves': 31,
-            'max_depth': 6,
-            'min_data_in_leaf': 50,
-            'learning_rate': 0.05,
-            'feature_fraction': 0.9,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'verbose': -1,
-            'seed': 42
-        }
-        # If Optuna is available, tune LightGBM hyperparameters for the median model
-        def tune_lgbm(X, y_log, groups, sample_weights):
-            def objective(trial):
-                params = lgb_base_params.copy()
-                params.update({
-                    'num_leaves': trial.suggest_int('num_leaves', 16, 64),
-                    'max_depth': trial.suggest_int('max_depth', 4, 10),
-                    'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 20, 100),
-                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
-                    'feature_fraction': trial.suggest_float('feature_fraction', 0.7, 1.0),
-                    'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 1.0),
-                })
-                params['alpha'] = 0.5
-                n_splits = 3
-                gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
-                scores = []
-                for train_idx, test_idx in gtscv.split(X, groups=groups):
-                    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-                    y_train, y_test = y_log[train_idx], y_log[test_idx]
-                    weights_train = sample_weights[train_idx]
-                    model = lgb.LGBMRegressor(**params, n_estimators=100)
-                    model.fit(
-                        X_train, y_train,
-                        sample_weight=weights_train,
-                        eval_set=[(X_test, y_test)],
-                        eval_sample_weight=[sample_weights[test_idx]],
-                        callbacks=[lgb.early_stopping(50, verbose=False)]
-                    )
-                    y_pred = model.predict(X_test)
-                    y_pred_orig = np.expm1(y_pred)
-                    y_test_orig = np.expm1(y_test)
-                    score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
-                    scores.append(score)
-                return -np.mean(scores)  # Minimize negative R^2
-            study = optuna.create_study(direction='minimize')
-            study.optimize(objective, n_trials=30, show_progress_bar=False)
-            best_params = lgb_base_params.copy()
-            best_params.update(study.best_params)
-            return best_params
-        # Tune or use defaults
-        try:
-            best_lgb_params = tune_lgbm(X[selected_features], y, store_ids, sample_weights)
-            logging.info(f"Optuna best LightGBM params: {best_lgb_params}")
-        except Exception as e:
-            logging.warning(f"Optuna tuning failed or not available, using defaults. Error: {e}")
-            best_lgb_params = lgb_base_params.copy()
-        # 1. Train median model
-        logging.info("\nTraining median model with selected features and early stopping...")
-        lgb_median_params = best_lgb_params.copy()
-        lgb_median_params['alpha'] = 0.5
-        median_model = lgb.LGBMRegressor(**lgb_median_params, n_estimators=100)
-        for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
-            X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
-            weights_train = sample_weights[train_idx]
-            median_model.fit(
-                X_train, y_train,
-                sample_weight=weights_train,
-                eval_set=[(X_test, y_test)],
-                eval_sample_weight=[sample_weights[test_idx]],
-                callbacks=[lgb.early_stopping(50, verbose=False)]
-            )
-            y_pred = median_model.predict(X_test)
-            y_pred_orig = np.expm1(y_pred)
-            y_test_orig = np.expm1(y_test)
-            score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
-            cv_scores['median'].append(score)
-        median_model.fit(
-            X[selected_features], y,
-            sample_weight=sample_weights,
-            eval_set=[(X[selected_features], y)],
-            eval_sample_weight=[sample_weights],
-            callbacks=[lgb.early_stopping(50, verbose=False)]
-        )
-        models['median'] = median_model
-        median_preds = np.expm1(median_model.predict(X[selected_features]))
-        lower_targets = np.clip(median_preds - y, 0, None)
-        upper_targets = np.clip(y - median_preds, 0, None)
-        importances = dict(zip(selected_features, median_model.feature_importances_))
-        sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
-        X_lower, lower_features = select_features_by_importance(X[selected_features], sorted_importances, 'lower')
-        X_upper, upper_features = select_features_by_importance(X[selected_features], sorted_importances, 'upper')
-        # Clean lower_targets and upper_targets for NaN/inf (after X_lower/X_upper are defined)
-        lower_mask = np.isfinite(lower_targets)
-        upper_mask = np.isfinite(upper_targets)
-        n_lower_removed = np.sum(~lower_mask)
-        n_upper_removed = np.sum(~upper_mask)
-        if n_lower_removed > 0:
-            logging.warning(f"Removed {n_lower_removed} rows with NaN/inf in lower_targets for quantile model training.")
-        if n_upper_removed > 0:
-            logging.warning(f"Removed {n_upper_removed} rows with NaN/inf in upper_targets for quantile model training.")
-        X_lower_clean = X_lower[lower_mask]
-        lower_targets_clean = lower_targets[lower_mask]
-        X_upper_clean = X_upper[upper_mask]
-        upper_targets_clean = upper_targets[upper_mask]
-        sample_weights_lower = sample_weights[lower_mask]
-        sample_weights_upper = sample_weights[upper_mask]
-        # 2. Train lower tail model on residuals
-        logging.info("\nTraining lower tail model with LightGBM quantile regression and early stopping...")
-        lgb_lower_params = best_lgb_params.copy()
-        lgb_lower_params['alpha'] = 0.05
-        lower_model = lgb.LGBMRegressor(**lgb_lower_params, n_estimators=100)
-        for train_idx, test_idx in gtscv.split(X_lower_clean, groups=store_ids[lower_mask]):
-            X_train, X_test = X_lower_clean.iloc[train_idx], X_lower_clean.iloc[test_idx]
-            y_train, y_test = lower_targets_clean[train_idx], lower_targets_clean[test_idx]
-            weights_train = sample_weights_lower[train_idx]
-            lower_model.fit(
-                X_train, y_train,
-                sample_weight=weights_train,
-                eval_set=[(X_test, y_test)],
-                eval_sample_weight=[sample_weights_lower[test_idx]],
-                callbacks=[lgb.early_stopping(50, verbose=False)]
-            )
-            y_pred = lower_model.predict(X_test)
-            score = np.corrcoef(y_test, y_pred)[0,1]**2
-            cv_scores['lower'].append(score)
-        lower_model.fit(
-            X_lower_clean, lower_targets_clean,
-            sample_weight=sample_weights_lower,
-            eval_set=[(X_lower_clean, lower_targets_clean)],
-            eval_sample_weight=[sample_weights_lower],
-            callbacks=[lgb.early_stopping(50, verbose=False)]
-        )
-        models['lower'] = lower_model
-        # 3. Train upper tail model on residuals
-        logging.info("\nTraining upper tail model with LightGBM quantile regression and early stopping...")
-        lgb_upper_params = best_lgb_params.copy()
-        lgb_upper_params['alpha'] = 0.95
-        upper_model = lgb.LGBMRegressor(**lgb_upper_params, n_estimators=100)
-        for train_idx, test_idx in gtscv.split(X_upper_clean, groups=store_ids[upper_mask]):
-            X_train, X_test = X_upper_clean.iloc[train_idx], X_upper_clean.iloc[test_idx]
-            y_train, y_test = upper_targets_clean[train_idx], upper_targets_clean[test_idx]
-            weights_train = sample_weights_upper[train_idx]
-            upper_model.fit(
-                X_train, y_train,
-                sample_weight=weights_train,
-                eval_set=[(X_test, y_test)],
-                eval_sample_weight=[sample_weights_upper[test_idx]],
-                callbacks=[lgb.early_stopping(50, verbose=False)]
-            )
-            y_pred = upper_model.predict(X_test)
-            score = np.corrcoef(y_test, y_pred)[0,1]**2
-            cv_scores['upper'].append(score)
-        upper_model.fit(
-            X_upper_clean, upper_targets_clean,
-            sample_weight=sample_weights_upper,
-            eval_set=[(X_upper_clean, upper_targets_clean)],
-            eval_sample_weight=[sample_weights_upper],
-            callbacks=[lgb.early_stopping(50, verbose=False)]
-        )
-        models['upper'] = upper_model
-        
-        # Calculate prediction interval metrics
-        historical_predictions = []
-        for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
-            X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
-            
-            # Get predictions for this fold
-            p50 = np.expm1(median_model.predict(X_test[selected_features]))
-            lower_residuals = lower_model.predict(X_test[lower_features])
-            upper_residuals = upper_model.predict(X_test[upper_features])
-            
-            # Calculate final predictions
-            p10 = p50 - lower_residuals
-            p90 = p50 + upper_residuals
-            
-            # Store predictions for calibration
-            fold_predictions = pd.DataFrame({
-                'revenue': y_test,
-                'p10': p10,
-                'p50': p50,
-                'p90': p90
+    # Common model parameters
+    model_params = {
+        'n_estimators': 100,  # Increased from 50 for better feature importance estimation
+        'max_depth': 8,
+        'min_samples_split': 5,
+        'min_samples_leaf': 2,
+        'random_state': 42,
+        'n_jobs': -1,
+        'verbose': 0
+    }
+    
+    # Apply iterative feature pruning
+    logging.info("\nStarting iterative feature pruning...")
+    best_model, selected_features, r2_scores = iterative_feature_pruning(
+        X=X,
+        y=y,
+        model_params=model_params,
+        n_iter=10
+    )
+    
+    logging.info(f"Selected {len(selected_features)} features after pruning")
+    
+    # Apply global SHAP-based feature selection
+    logging.info("\nApplying global SHAP-based feature selection...")
+    selected_features = select_features_by_global_shap(
+        X=X[selected_features],
+        y=y,
+        store_ids=store_ids,
+        n_features=25,  # Keep top 25 stable features
+        n_trees=100,
+        n_splits=5
+    )
+    logging.info(f"Selected {len(selected_features)} features after global SHAP analysis")
+    
+    # Train final models with selected features
+    models = {}
+    cv_scores = {model_type: [] for model_type in ['median', 'lower', 'upper']}
+    cv_metrics = []
+    
+    # Initialize GroupTimeSeriesSplit
+    n_splits = 5
+    gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
+    
+    # LightGBM default parameters with regularization and early stopping
+    lgb_base_params = {
+        'objective': 'quantile',
+        'metric': 'quantile',
+        'boosting_type': 'gbdt',
+        'num_leaves': 31,
+        'max_depth': 6,
+        'min_data_in_leaf': 50,
+        'learning_rate': 0.05,
+        'feature_fraction': 0.9,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 5,
+        'verbose': -1,
+        'seed': 42
+    }
+    # If Optuna is available, tune LightGBM hyperparameters for the median model
+    def tune_lgbm(X, y_log, groups, sample_weights):
+        def objective(trial):
+            params = lgb_base_params.copy()
+            params.update({
+                'num_leaves': trial.suggest_int('num_leaves', 16, 64),
+                'max_depth': trial.suggest_int('max_depth', 4, 10),
+                'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 20, 100),
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+                'feature_fraction': trial.suggest_float('feature_fraction', 0.7, 1.0),
+                'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 1.0),
             })
-            historical_predictions.append(fold_predictions)
-            
-            # Calculate metrics
-            fold_metrics = calculate_prediction_metrics(y_test, p10, p50, p90)
-            cv_metrics.append(fold_metrics)
-        
-        # Combine and save historical predictions
-        historical_predictions_df = pd.concat(historical_predictions, axis=0)
-        historical_predictions_df.to_json('models/historical_predictions.json')
-        
-        # Calculate average metrics
-        avg_metrics = {
-            'coverage': np.mean([m['coverage'] for m in cv_metrics]),
-            'sharpness': np.mean([m['sharpness'] for m in cv_metrics]),
-            'rmse': np.mean([m['rmse'] for m in cv_metrics]),
-            'mae': np.mean([m['mae'] for m in cv_metrics])
-        }
-        
-        # Log cross-validation scores and metrics
-        logging.info("\nCross-validation scores and metrics:")
-        for model_type in ['median', 'lower', 'upper']:
-            mean_score = np.mean(cv_scores[model_type])
-            std_score = np.std(cv_scores[model_type])
-            feature_count = len(selected_features) if model_type == 'median' else len(lower_features if model_type == 'lower' else upper_features)
-            logging.info(f"{model_type} - Mean R²: {mean_score:.3f} (±{std_score:.3f}), Features: {feature_count}")
-        
-        logging.info("\nPrediction Interval Metrics:")
-        logging.info(f"Coverage: {avg_metrics['coverage']:.1f}%")
-        logging.info(f"Sharpness: {avg_metrics['sharpness']:.2f}")
-        logging.info(f"RMSE: {avg_metrics['rmse']:.2f}")
-        logging.info(f"MAE: {avg_metrics['mae']:.2f}")
-        
-        # Save models and features
-        Path('models').mkdir(exist_ok=True)
-        model_path = 'models/brandA_models.pkl'
-        features_path = 'models/brandA_features.json'
-        selected_features_path = 'models/brandA_selected_features.json'
-        feature_names_path = 'models/brandA_feature_names.json'
-        
-        # Save models
-        joblib.dump(models, model_path, compress=3)
-        
-        # Save feature information
-        feature_info = {
-            'all_features': selected_features,
-            'lower_features': lower_features,
-            'upper_features': upper_features
-        }
-        
-        with open(features_path, 'w') as f:
-            json.dump(features, f)
-        with open(selected_features_path, 'w') as f:
-            json.dump(feature_info, f)
-        with open(feature_names_path, 'w') as f:
-            json.dump(feature_info, f)
-        
-        logging.info("Models and features saved successfully")
-        
-        # 2. After model training, split last 10% of data as test set by date
-        n_test = int(0.1 * len(X))
-        test_idx = np.arange(len(X) - n_test, len(X))
-        train_idx = np.arange(0, len(X) - n_test)
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        # Predict on test set
-        p50_test = np.expm1(median_model.predict(X_test[selected_features]))
-        lower_resid_test = lower_model.predict(X_test[lower_features])
-        upper_resid_test = upper_model.predict(X_test[upper_features])
-        p10_test = p50_test - lower_resid_test
-        p90_test = p50_test + upper_resid_test
-        # Ensure p10 < p50 < p90
-        p10_test, p50_test, p90_test = np.sort(np.vstack([p10_test, p50_test, p90_test]), axis=0)
-        # Calculate metrics
-        future_metrics = calculate_prediction_metrics(y_test, p10_test, p50_test, p90_test)
-        logging.info(f"Future slice metrics (last 10%): {future_metrics}")
-        
-        return {
-            'cv_scores': cv_scores,
-            'feature_importances': sorted_importances,
-            'selected_features': feature_info,
-            'feature_names': feature_info,
-            'train_scores': {
-                'median': np.mean(cv_scores['median']),
-                'lower': np.mean(cv_scores['lower']),
-                'upper': np.mean(cv_scores['upper'])
-            },
-            'test_scores': {
-                'median': np.mean(cv_scores['median']),
-                'lower': np.mean(cv_scores['lower']),
-                'upper': np.mean(cv_scores['upper'])
-            },
-            'prediction_metrics': avg_metrics,
-            'r2_progression': r2_scores,
-            'future_metrics': future_metrics
-        }
+            params['alpha'] = 0.5
+            n_splits = 3
+            gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
+            scores = []
+            for train_idx, test_idx in gtscv.split(X, groups=groups):
+                X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+                y_train, y_test = y_log[train_idx], y_log[test_idx]
+                weights_train = sample_weights[train_idx]
+                model = lgb.LGBMRegressor(**params, n_estimators=100)
+                model.fit(
+                    X_train, y_train,
+                    sample_weight=weights_train,
+                    eval_set=[(X_test, y_test)],
+                    eval_sample_weight=[sample_weights[test_idx]],
+                    callbacks=[lgb.early_stopping(50, verbose=False)]
+                )
+                y_pred = model.predict(X_test)
+                y_pred_orig = np.expm1(y_pred)
+                y_test_orig = np.expm1(y_test)
+                score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
+                scores.append(score)
+            return -np.mean(scores)  # Minimize negative R^2
+        study = optuna.create_study(direction='minimize')
+        study.optimize(objective, n_trials=30, show_progress_bar=False)
+        best_params = lgb_base_params.copy()
+        best_params.update(study.best_params)
+        return best_params
+    # Tune or use defaults
+    try:
+        best_lgb_params = tune_lgbm(X[selected_features], y, store_ids, sample_weights)
+        logging.info(f"Optuna best LightGBM params: {best_lgb_params}")
     except Exception as e:
-        logging.error(f"Error during model training: {str(e)}")
-        logging.error("Full traceback:")
-        import traceback
-        logging.error(traceback.format_exc())
-        raise
+        logging.warning(f"Optuna tuning failed or not available, using defaults. Error: {e}")
+        best_lgb_params = lgb_base_params.copy()
+    # 1. Train median model
+    logging.info("\nTraining median model with selected features and early stopping...")
+    lgb_median_params = best_lgb_params.copy()
+    lgb_median_params['alpha'] = 0.5
+    median_model = lgb.LGBMRegressor(**lgb_median_params, n_estimators=100)
+    for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
+        X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        weights_train = sample_weights[train_idx]
+        median_model.fit(
+            X_train, y_train,
+            sample_weight=weights_train,
+            eval_set=[(X_test, y_test)],
+            eval_sample_weight=[sample_weights[test_idx]],
+            callbacks=[lgb.early_stopping(50, verbose=False)]
+        )
+        y_pred = median_model.predict(X_test)
+        y_pred_orig = np.expm1(y_pred)
+        y_test_orig = np.expm1(y_test)
+        score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
+        cv_scores['median'].append(score)
+    median_model.fit(
+        X[selected_features], y,
+        sample_weight=sample_weights,
+        eval_set=[(X[selected_features], y)],
+        eval_sample_weight=[sample_weights],
+        callbacks=[lgb.early_stopping(50, verbose=False)]
+    )
+    models['median'] = median_model
+    median_preds = np.expm1(median_model.predict(X[selected_features]))
+    lower_targets = np.clip(median_preds - y, 0, None)
+    upper_targets = np.clip(y - median_preds, 0, None)
+    importances = dict(zip(selected_features, median_model.feature_importances_))
+    sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
+    X_lower, lower_features = select_features_by_importance(X[selected_features], sorted_importances, 'lower')
+    X_upper, upper_features = select_features_by_importance(X[selected_features], sorted_importances, 'upper')
+    # Clean lower_targets and upper_targets for NaN/inf (after X_lower/X_upper are defined)
+    lower_mask = np.isfinite(lower_targets)
+    upper_mask = np.isfinite(upper_targets)
+    n_lower_removed = np.sum(~lower_mask)
+    n_upper_removed = np.sum(~upper_mask)
+    if n_lower_removed > 0:
+        logging.warning(f"Removed {n_lower_removed} rows with NaN/inf in lower_targets for quantile model training.")
+    if n_upper_removed > 0:
+        logging.warning(f"Removed {n_upper_removed} rows with NaN/inf in upper_targets for quantile model training.")
+    X_lower_clean = X_lower[lower_mask]
+    lower_targets_clean = lower_targets[lower_mask]
+    X_upper_clean = X_upper[upper_mask]
+    upper_targets_clean = upper_targets[upper_mask]
+    sample_weights_lower = sample_weights[lower_mask]
+    sample_weights_upper = sample_weights[upper_mask]
+    # 2. Train lower tail model on residuals
+    logging.info("\nTraining lower tail model with LightGBM quantile regression and early stopping...")
+    lgb_lower_params = best_lgb_params.copy()
+    lgb_lower_params['alpha'] = 0.05
+    lower_model = lgb.LGBMRegressor(**lgb_lower_params, n_estimators=100)
+    for train_idx, test_idx in gtscv.split(X_lower_clean, groups=store_ids[lower_mask]):
+        X_train, X_test = X_lower_clean.iloc[train_idx], X_lower_clean.iloc[test_idx]
+        y_train, y_test = lower_targets_clean[train_idx], lower_targets_clean[test_idx]
+        weights_train = sample_weights_lower[train_idx]
+        lower_model.fit(
+            X_train, y_train,
+            sample_weight=weights_train,
+            eval_set=[(X_test, y_test)],
+            eval_sample_weight=[sample_weights_lower[test_idx]],
+            callbacks=[lgb.early_stopping(50, verbose=False)]
+        )
+        y_pred = lower_model.predict(X_test)
+        score = np.corrcoef(y_test, y_pred)[0,1]**2
+        cv_scores['lower'].append(score)
+    lower_model.fit(
+        X_lower_clean, lower_targets_clean,
+        sample_weight=sample_weights_lower,
+        eval_set=[(X_lower_clean, lower_targets_clean)],
+        eval_sample_weight=[sample_weights_lower],
+        callbacks=[lgb.early_stopping(50, verbose=False)]
+    )
+    models['lower'] = lower_model
+    # 3. Train upper tail model on residuals
+    logging.info("\nTraining upper tail model with LightGBM quantile regression and early stopping...")
+    lgb_upper_params = best_lgb_params.copy()
+    lgb_upper_params['alpha'] = 0.95
+    upper_model = lgb.LGBMRegressor(**lgb_upper_params, n_estimators=100)
+    for train_idx, test_idx in gtscv.split(X_upper_clean, groups=store_ids[upper_mask]):
+        X_train, X_test = X_upper_clean.iloc[train_idx], X_upper_clean.iloc[test_idx]
+        y_train, y_test = upper_targets_clean[train_idx], upper_targets_clean[test_idx]
+        weights_train = sample_weights_upper[train_idx]
+        upper_model.fit(
+            X_train, y_train,
+            sample_weight=weights_train,
+            eval_set=[(X_test, y_test)],
+            eval_sample_weight=[sample_weights_upper[test_idx]],
+            callbacks=[lgb.early_stopping(50, verbose=False)]
+        )
+        y_pred = upper_model.predict(X_test)
+        score = np.corrcoef(y_test, y_pred)[0,1]**2
+        cv_scores['upper'].append(score)
+    upper_model.fit(
+        X_upper_clean, upper_targets_clean,
+        sample_weight=sample_weights_upper,
+        eval_set=[(X_upper_clean, upper_targets_clean)],
+        eval_sample_weight=[sample_weights_upper],
+        callbacks=[lgb.early_stopping(50, verbose=False)]
+    )
+    models['upper'] = upper_model
+    
+    # Calculate prediction interval metrics
+    historical_predictions = []
+    for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
+        X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+        
+        # Get predictions for this fold
+        p50 = np.expm1(median_model.predict(X_test[selected_features]))
+        lower_residuals = lower_model.predict(X_test[lower_features])
+        upper_residuals = upper_model.predict(X_test[upper_features])
+        
+        # Calculate final predictions
+        p10 = p50 - lower_residuals
+        p90 = p50 + upper_residuals
+        
+        # Store predictions for calibration
+        fold_predictions = pd.DataFrame({
+            'revenue': y_test,
+            'p10': p10,
+            'p50': p50,
+            'p90': p90
+        })
+        historical_predictions.append(fold_predictions)
+        
+        # Calculate metrics
+        fold_metrics = calculate_prediction_metrics(y_test, p10, p50, p90)
+        cv_metrics.append(fold_metrics)
+    
+    # Combine and save historical predictions
+    historical_predictions_df = pd.concat(historical_predictions, axis=0)
+    historical_predictions_df.to_json('models/historical_predictions.json')
+    
+    # Calculate average metrics
+    avg_metrics = {
+        'coverage': np.mean([m['coverage'] for m in cv_metrics]),
+        'sharpness': np.mean([m['sharpness'] for m in cv_metrics]),
+        'rmse': np.mean([m['rmse'] for m in cv_metrics]),
+        'mae': np.mean([m['mae'] for m in cv_metrics])
+    }
+    
+    # Log cross-validation scores and metrics
+    logging.info("\nCross-validation scores and metrics:")
+    for model_type in ['median', 'lower', 'upper']:
+        mean_score = np.mean(cv_scores[model_type])
+        std_score = np.std(cv_scores[model_type])
+        feature_count = len(selected_features) if model_type == 'median' else len(lower_features if model_type == 'lower' else upper_features)
+        logging.info(f"{model_type} - Mean R²: {mean_score:.3f} (±{std_score:.3f}), Features: {feature_count}")
+    
+    logging.info("\nPrediction Interval Metrics:")
+    logging.info(f"Coverage: {avg_metrics['coverage']:.1f}%")
+    logging.info(f"Sharpness: {avg_metrics['sharpness']:.2f}")
+    logging.info(f"RMSE: {avg_metrics['rmse']:.2f}")
+    logging.info(f"MAE: {avg_metrics['mae']:.2f}")
+    
+    # Save models and features
+    Path('models').mkdir(exist_ok=True)
+    model_path = 'models/brandA_models.pkl'
+    features_path = 'models/brandA_features.json'
+    selected_features_path = 'models/brandA_selected_features.json'
+    feature_names_path = 'models/brandA_feature_names.json'
+    
+    # Save models
+    joblib.dump(models, model_path, compress=3)
+    
+    # Save feature information
+    feature_info = {
+        'all_features': selected_features,
+        'lower_features': lower_features,
+        'upper_features': upper_features
+    }
+    
+    with open(features_path, 'w') as f:
+        json.dump(features, f)
+    with open(selected_features_path, 'w') as f:
+        json.dump(feature_info, f)
+    with open(feature_names_path, 'w') as f:
+        json.dump(feature_info, f)
+    
+    logging.info("Models and features saved successfully")
+    
+    # 2. After model training, split last 10% of data as test set by date
+    n_test = int(0.1 * len(X))
+    test_idx = np.arange(len(X) - n_test, len(X))
+    train_idx = np.arange(0, len(X) - n_test)
+    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    # Predict on test set
+    p50_test = np.expm1(median_model.predict(X_test[selected_features]))
+    lower_resid_test = lower_model.predict(X_test[lower_features])
+    upper_resid_test = upper_model.predict(X_test[upper_features])
+    p10_test = p50_test - lower_resid_test
+    p90_test = p50_test + upper_resid_test
+    # Ensure p10 < p50 < p90
+    p10_test, p50_test, p90_test = np.sort(np.vstack([p10_test, p50_test, p90_test]), axis=0)
+    # Calculate metrics
+    future_metrics = calculate_prediction_metrics(y_test, p10_test, p50_test, p90_test)
+    logging.info(f"Future slice metrics (last 10%): {future_metrics}")
+    
+    return {
+        'cv_scores': cv_scores,
+        'feature_importances': sorted_importances,
+        'selected_features': feature_info,
+        'feature_names': feature_info,
+        'train_scores': {
+            'median': np.mean(cv_scores['median']),
+            'lower': np.mean(cv_scores['lower']),
+            'upper': np.mean(cv_scores['upper'])
+        },
+        'test_scores': {
+            'median': np.mean(cv_scores['median']),
+            'lower': np.mean(cv_scores['lower']),
+            'upper': np.mean(cv_scores['upper'])
+        },
+        'prediction_metrics': avg_metrics,
+        'r2_progression': r2_scores,
+        'future_metrics': future_metrics
+    }
