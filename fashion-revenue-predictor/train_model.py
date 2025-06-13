@@ -13,7 +13,7 @@ from scipy.stats import boxcox
 import joblib
 from sklearn.preprocessing import OneHotEncoder
 from predictor import calculate_prediction_metrics
-from utils.feature_selection import iterative_feature_pruning
+from utils.feature_selection import iterative_feature_pruning, select_features_by_global_shap
 
 # Remove any existing handlers
 for handler in logging.root.handlers[:]:
@@ -254,6 +254,18 @@ def train_model(df_sales, df_stores):
         )
         
         logging.info(f"Selected {len(selected_features)} features after pruning")
+        
+        # Apply global SHAP-based feature selection
+        logging.info("\nApplying global SHAP-based feature selection...")
+        selected_features = select_features_by_global_shap(
+            X=X[selected_features],
+            y=y,
+            store_ids=store_ids,
+            n_features=25,  # Keep top 25 stable features
+            n_trees=100,
+            n_splits=5
+        )
+        logging.info(f"Selected {len(selected_features)} features after global SHAP analysis")
         
         # Train final models with selected features
         models = {}

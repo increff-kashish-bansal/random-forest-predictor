@@ -14,6 +14,64 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import BaseEstimator
 from sklearn.decomposition import PCA
 
+class GroupTimeSeriesSplit:
+    """
+    Time series cross-validator with group-based splitting.
+    This ensures that data from the same group (e.g., store) stays together in splits.
+    """
+    def __init__(self, n_splits: int = 5, test_size: float = 0.2):
+        self.n_splits = n_splits
+        self.test_size = test_size
+        self.tscv = TimeSeriesSplit(n_splits=n_splits, test_size=int(1/test_size))
+    
+    def split(self, X, y=None, groups=None):
+        """
+        Generate indices to split data into training and test sets.
+        
+        Args:
+            X: Feature matrix
+            y: Target values (optional)
+            groups: Group labels (e.g., store IDs)
+            
+        Yields:
+            train_idx, test_idx: Indices for training and test sets
+        """
+        if groups is None:
+            # If no groups provided, use regular TimeSeriesSplit
+            yield from self.tscv.split(X, y)
+            return
+            
+        # Get unique groups and their indices
+        unique_groups = np.unique(groups)
+        n_groups = len(unique_groups)
+        
+        # Calculate number of groups for test set
+        n_test_groups = max(1, int(n_groups * self.test_size))
+        
+        # Generate splits
+        for i in range(self.n_splits):
+            # Calculate test group indices
+            test_start = (i * n_test_groups) % n_groups
+            test_end = (test_start + n_test_groups) % n_groups
+            
+            if test_end > test_start:
+                test_groups = unique_groups[test_start:test_end]
+            else:
+                # Handle wrap-around case
+                test_groups = np.concatenate([
+                    unique_groups[test_start:],
+                    unique_groups[:test_end]
+                ])
+            
+            # Get indices for train and test sets
+            test_mask = np.isin(groups, test_groups)
+            train_mask = ~test_mask
+            
+            train_idx = np.where(train_mask)[0]
+            test_idx = np.where(test_mask)[0]
+            
+            yield train_idx, test_idx
+
 def remove_near_zero_variance(X: pd.DataFrame, threshold: float = 0.01) -> Tuple[pd.DataFrame, List[str]]:
     """
     Remove features with near-zero variance.
@@ -182,6 +240,98 @@ def prune_features(X: pd.DataFrame, feature_importances: Dict[str, float] = None
     
     return X, removed_features
 
+def select_features_by_global_shap(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    store_ids: np.ndarray,
+    n_features: int = 25,
+    n_trees: int = 100,
+    n_splits: int = 5
+) -> List[str]:
+    """
+    Select features based on SHAP values calculated globally across all CV folds.
+    
+    Args:
+        X: Feature matrix
+        y: Target values
+        store_ids: Array of store IDs for time series splitting
+        n_features: Number of top features to select
+        n_trees: Number of trees to use for SHAP calculation
+        n_splits: Number of CV splits
+        
+    Returns:
+        List of selected feature names
+    """
+    logging.info(f"Starting global SHAP-based feature selection with {n_splits} CV folds...")
+    
+    # Initialize dictionary to store SHAP values across folds
+    all_shap_values = {feature: [] for feature in X.columns}
+    
+    # Initialize GroupTimeSeriesSplit
+    gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
+    
+    # Calculate SHAP values for each fold
+    for fold, (train_idx, test_idx) in enumerate(gtscv.split(X, groups=store_ids)):
+        logging.info(f"Processing fold {fold + 1}/{n_splits}...")
+        
+        X_train = X.iloc[train_idx]
+        y_train = y[train_idx]
+        
+        # Train a quick Random Forest for SHAP calculation
+        rf = RandomForestRegressor(
+            n_estimators=n_trees,
+            max_depth=5,  # Shallow trees for faster computation
+            min_samples_leaf=5,
+            random_state=42,
+            n_jobs=-1
+        )
+        rf.fit(X_train, y_train)
+        
+        # Calculate SHAP values
+        explainer = shap.TreeExplainer(rf)
+        shap_values = explainer.shap_values(X_train)
+        
+        # Calculate mean absolute SHAP values for each feature
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        
+        # Store SHAP values for each feature
+        for feature, importance in zip(X.columns, mean_abs_shap):
+            all_shap_values[feature].append(importance)
+    
+    # Calculate mean and std of SHAP values across folds
+    feature_stability = {}
+    for feature, values in all_shap_values.items():
+        mean_importance = np.mean(values)
+        std_importance = np.std(values)
+        # Calculate stability score (mean / std)
+        stability_score = mean_importance / (std_importance + 1e-10)  # Add small epsilon to avoid division by zero
+        feature_stability[feature] = {
+            'mean_importance': mean_importance,
+            'std_importance': std_importance,
+            'stability_score': stability_score
+        }
+    
+    # Sort features by stability score
+    sorted_features = sorted(
+        feature_stability.items(),
+        key=lambda x: x[1]['stability_score'],
+        reverse=True
+    )
+    
+    # Select top N features
+    selected_features = [f[0] for f in sorted_features[:n_features]]
+    
+    # Log feature selection results
+    logging.info(f"\nSelected {len(selected_features)} features based on global SHAP analysis")
+    logging.info("\nTop 10 most stable features:")
+    for feature, stats in sorted_features[:10]:
+        logging.info(f"{feature}:")
+        logging.info(f"  Mean importance: {stats['mean_importance']:.4f}")
+        logging.info(f"  Std importance: {stats['std_importance']:.4f}")
+        logging.info(f"  Stability score: {stats['stability_score']:.4f}")
+    
+    return selected_features
+
 def select_features_by_shap(
     X: pd.DataFrame,
     y: np.ndarray,
@@ -191,6 +341,8 @@ def select_features_by_shap(
 ) -> Dict[str, List[str]]:
     """
     Select features based on SHAP values per cluster.
+    This function is kept for backward compatibility but is deprecated.
+    Use select_features_by_global_shap instead.
     
     Args:
         X: Feature matrix
@@ -202,7 +354,7 @@ def select_features_by_shap(
     Returns:
         Dictionary mapping cluster IDs to lists of selected feature names
     """
-    logging.info(f"Starting SHAP-based feature selection for {len(np.unique(clusters))} clusters...")
+    logging.warning("This function is deprecated. Use select_features_by_global_shap instead.")
     
     # Initialize dictionary to store selected features per cluster
     selected_features = {}
@@ -498,6 +650,7 @@ def group_correlated_features_pca(X: pd.DataFrame, correlation_threshold: float 
 def iterative_feature_pruning(X: pd.DataFrame, y: pd.Series, model_params: dict, n_iter: int = 10) -> Tuple[RandomForestRegressor, List[str], List[float]]:
     """
     Iteratively prune features using multiple methods.
+    Skips VIF pruning for tree-based models since they can handle correlated features.
     
     Args:
         X: Feature matrix
@@ -540,11 +693,8 @@ def iterative_feature_pruning(X: pd.DataFrame, y: pd.Series, model_params: dict,
             current_features = group_correlated_features_pca(X_current, correlation_threshold=0.7)
             logging.info(f"Features after PCA grouping: {len(current_features)}")
             
-            # 2. Remove features with high VIF (only for numeric features)
-            logging.info("Starting VIF analysis...")
-            X_current = X[current_features]
-            current_features = remove_high_vif_features(X_current, threshold=5.0)
-            logging.info(f"Features after VIF pruning: {len(current_features)}")
+            # 2. Skip VIF pruning for tree-based models
+            logging.info("Skipping VIF pruning for tree-based model...")
             
             # 3. Train model and evaluate
             logging.info("Training model with current feature set...")
