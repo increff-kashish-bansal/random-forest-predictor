@@ -250,12 +250,101 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_predicti
         df['qty_sold_7d_avg'] = df.groupby('store')['qty_sold'].transform(
             lambda x: x.rolling(7, min_periods=1).mean()
         )
-        features.extend(['revenue_7d_avg', 'qty_sold_7d_avg'])
+        
+        # Add trend-based features
+        logging.info("Adding trend-based features...")
+        
+        # Function to calculate rolling slope
+        def rolling_slope(x, window):
+            if len(x) < 2:
+                return 0
+            try:
+                return np.polyfit(np.arange(len(x)), x, 1)[0]
+            except:
+                return 0
+        
+        # Revenue trend slopes for different windows
+        for window in [7, 14, 30]:
+            df[f'revenue_trend_slope_{window}d'] = df.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(window, min_periods=5).apply(
+                    lambda y: rolling_slope(y, window)
+                )
+            )
+            
+            df[f'qty_trend_slope_{window}d'] = df.groupby('store')['qty_sold'].transform(
+                lambda x: x.rolling(window, min_periods=5).apply(
+                    lambda y: rolling_slope(y, window)
+                )
+            )
+        
+        # Calculate momentum indicators
+        df['revenue_momentum_7d'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.pct_change(7).rolling(7, min_periods=1).mean()
+        )
+        
+        df['qty_momentum_7d'] = df.groupby('store')['qty_sold'].transform(
+            lambda x: x.pct_change(7).rolling(7, min_periods=1).mean()
+        )
+        
+        # Add acceleration features (change in momentum)
+        df['revenue_acceleration_7d'] = df.groupby('store')['revenue_momentum_7d'].transform(
+            lambda x: x.diff().rolling(7, min_periods=1).mean()
+        )
+        
+        df['qty_acceleration_7d'] = df.groupby('store')['qty_momentum_7d'].transform(
+            lambda x: x.diff().rolling(7, min_periods=1).mean()
+        )
+        
+        # Add trend strength indicators
+        for window in [7, 14, 30]:
+            df[f'revenue_trend_strength_{window}d'] = df.groupby('store')['revenue'].transform(
+                lambda x: x.rolling(window, min_periods=5).apply(
+                    lambda y: np.corrcoef(np.arange(len(y)), y)[0, 1] if len(y) > 1 else 0
+                )
+            )
+        
+        features.extend([
+            'revenue_7d_avg', 'qty_sold_7d_avg',
+            'revenue_trend_slope_7d', 'revenue_trend_slope_14d', 'revenue_trend_slope_30d',
+            'qty_trend_slope_7d', 'qty_trend_slope_14d', 'qty_trend_slope_30d',
+            'revenue_momentum_7d', 'qty_momentum_7d',
+            'revenue_acceleration_7d', 'qty_acceleration_7d',
+            'revenue_trend_strength_7d', 'revenue_trend_strength_14d', 'revenue_trend_strength_30d'
+        ])
     else:
         # During prediction, use store-level means
         df['revenue_7d_avg'] = df['revenue_mean']
         df['qty_sold_7d_avg'] = df['qty_sold_mean']
-        features.extend(['revenue_7d_avg', 'qty_sold_7d_avg'])
+        
+        # For prediction, we'll use the last known trend values
+        # These should be loaded from a saved model state
+        try:
+            with open('models/trend_features.json', 'r') as f:
+                trend_features = json.load(f)
+            
+            # Add trend features from saved state
+            for feature, value in trend_features.items():
+                df[feature] = value
+        except FileNotFoundError:
+            # If no trend features available, use zeros
+            trend_features = [
+                'revenue_trend_slope_7d', 'revenue_trend_slope_14d', 'revenue_trend_slope_30d',
+                'qty_trend_slope_7d', 'qty_trend_slope_14d', 'qty_trend_slope_30d',
+                'revenue_momentum_7d', 'qty_momentum_7d',
+                'revenue_acceleration_7d', 'qty_acceleration_7d',
+                'revenue_trend_strength_7d', 'revenue_trend_strength_14d', 'revenue_trend_strength_30d'
+            ]
+            for feature in trend_features:
+                df[feature] = 0
+        
+        features.extend([
+            'revenue_7d_avg', 'qty_sold_7d_avg',
+            'revenue_trend_slope_7d', 'revenue_trend_slope_14d', 'revenue_trend_slope_30d',
+            'qty_trend_slope_7d', 'qty_trend_slope_14d', 'qty_trend_slope_30d',
+            'revenue_momentum_7d', 'qty_momentum_7d',
+            'revenue_acceleration_7d', 'qty_acceleration_7d',
+            'revenue_trend_strength_7d', 'revenue_trend_strength_14d', 'revenue_trend_strength_30d'
+        ])
     
     # Select features and handle missing values
     logging.info("Selecting final features...")
