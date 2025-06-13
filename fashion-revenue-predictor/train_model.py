@@ -183,7 +183,13 @@ def train_model(df_sales, df_stores):
         
         median_model.fit(X_train, y_train, sample_weight=weights_train)
         y_pred = median_model.predict(X_test)
-        score = np.corrcoef(y_test, y_pred)[0,1]**2
+        
+        # Transform predictions and true values back to original scale
+        y_pred_orig = np.expm1(y_pred)
+        y_test_orig = np.expm1(y_test)
+        
+        # Calculate R² on original scale
+        score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
         cv_scores['median'].append(score)
     
     # Train final median model on all data
@@ -243,7 +249,7 @@ def train_model(df_sales, df_stores):
         
         # Get predictions for this fold
         p10 = lower_model.predict(X_test[feature_names['lower_features']])
-        p50 = np.expm1(median_model.predict(X_test[feature_names['all_features']]))
+        p50 = np.expm1(median_model.predict(X_test[feature_names['all_features']]))  # Transform median predictions back
         p90 = upper_model.predict(X_test[feature_names['upper_features']])
         
         # Calculate metrics
