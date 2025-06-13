@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import shap
 from typing import Dict, List, Tuple
+from scipy.special import inv_boxcox
 
 def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     """
@@ -23,6 +24,10 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
         model = pickle.load(f)
     with open('models/brandA_features.json', 'r') as f:
         required_features = json.load(f)
+    
+    # Load Box-Cox lambda parameter
+    with open('models/boxcox_lambda.json', 'r') as f:
+        lambda_ = json.load(f)['lambda']
     
     # Ensure all required features are present
     missing_features = set(required_features) - set(df_X.columns)
@@ -56,41 +61,35 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     
     # Add weekend effect if available
     if 'is_weekend' in df_X.columns:
-        uncertainty *= (1 + 0.2 * df_X['is_weekend'].values)  # 20% more uncertainty on weekends
+        weekend_multiplier = 1.2  # Increase uncertainty for weekends
+        uncertainty *= (1 + (df_X['is_weekend'].values * (weekend_multiplier - 1)))
     
-    # Calculate dynamic percentiles
-    pred_dict = {
-        'p50': base_predictions,
-        'p10': base_predictions - 1.28 * uncertainty,  # 1.28 is the z-score for 10th percentile
-        'p90': base_predictions + 1.28 * uncertainty   # 1.28 is the z-score for 90th percentile
-    }
+    # Calculate prediction intervals
+    p10 = base_predictions - 1.28 * uncertainty
+    p50 = base_predictions
+    p90 = base_predictions + 1.28 * uncertainty
     
-    # Ensure predictions are non-negative
-    for key in pred_dict:
-        pred_dict[key] = np.maximum(pred_dict[key], 0)
+    # Inverse transform predictions
+    p10 = inv_boxcox(p10, lambda_) - 1e-3
+    p50 = inv_boxcox(p50, lambda_) - 1e-3
+    p90 = inv_boxcox(p90, lambda_) - 1e-3
     
     # Calculate SHAP values
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(df_X[required_features])
     
-    # Log top SHAP features
-    print("\nTop SHAP features for prediction:")
-    top_shap = sorted(zip(df_X.columns, shap_values[0]), key=lambda x: abs(x[1]), reverse=True)[:10]
-    for feature, value in top_shap:
-        print(f"{feature}: {value:.3f}")
+    # Get feature importance scores
+    feature_importance = np.abs(shap_values).mean(axis=0)
+    feature_importance = dict(zip(required_features, feature_importance))
+    sorted_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
     
-    # Get top 5 features by absolute SHAP value
-    mean_shap = np.abs(shap_values).mean(axis=0)
-    top_5_idx = np.argsort(mean_shap)[-5:][::-1]
-    top_5_features = [(required_features[i], mean_shap[i]) for i in top_5_idx]
-    
-    # Convert SHAP values to list for JSON serialization
-    shap_list = shap_values.tolist()
+    # Get top 5 features
+    top_5_features = list(sorted_importance.items())[:5]
     
     return {
-        'p10': pred_dict['p10'].tolist(),
-        'p50': pred_dict['p50'].tolist(),
-        'p90': pred_dict['p90'].tolist(),
-        'shap_values': shap_list,
+        'p10': p10,
+        'p50': p50,
+        'p90': p90,
+        'shap_values': shap_values,
         'top_5_features': top_5_features
     }

@@ -8,6 +8,7 @@ from typing import List, Dict
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from utils.feature_engineering import derive_features
+from scipy.stats import boxcox
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +28,15 @@ def train_model(df_sales, df_stores):
     # Derive features
     X, features = derive_features(df_sales, df_stores, is_prediction=False)
     y = df_sales['revenue'].values
+    
+    # Apply Box-Cox transformation to revenue
+    logging.info("Applying Box-Cox transformation to revenue...")
+    y_transformed, lambda_ = boxcox(y + 1e-3)  # Add small constant to handle zeros
+    
+    # Save lambda parameter for prediction
+    Path('models').mkdir(exist_ok=True)
+    with open('models/boxcox_lambda.json', 'w') as f:
+        json.dump({'lambda': float(lambda_)}, f)
     
     # Log feature matrix info after first derive_features call
     print(f"X.shape: {X.shape}")
@@ -48,15 +58,15 @@ def train_model(df_sales, df_stores):
         print(f"- {feat}")
     
     # Ensure X and y have same number of samples
-    if len(X) != len(y):
-        logging.error(f"Feature matrix X ({len(X)} samples) and target y ({len(y)} samples) have different lengths")
-        raise ValueError(f"Feature matrix X ({len(X)} samples) and target y ({len(y)} samples) have different lengths")
+    if len(X) != len(y_transformed):
+        logging.error(f"Feature matrix X ({len(X)} samples) and target y ({len(y_transformed)} samples) have different lengths")
+        raise ValueError(f"Feature matrix X ({len(X)} samples) and target y ({len(y_transformed)} samples) have different lengths")
     
     logging.info(f"Feature matrix shape: {X.shape}")
-    logging.info(f"Target vector shape: {y.shape}")
+    logging.info(f"Target vector shape: {y_transformed.shape}")
     
     # Split data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X, y_transformed, test_size=0.2, random_state=42)
     logging.info(f"Training set shape: {X_train.shape}")
     logging.info(f"Test set shape: {X_test.shape}")
     
