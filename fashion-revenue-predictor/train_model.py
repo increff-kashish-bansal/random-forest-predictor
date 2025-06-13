@@ -3,6 +3,7 @@ import numpy as np
 import json
 import pickle
 import logging
+import sys
 from pathlib import Path
 from typing import List, Dict, Tuple
 from sklearn.ensemble import RandomForestRegressor
@@ -14,15 +15,36 @@ from sklearn.preprocessing import OneHotEncoder
 from predictor import calculate_prediction_metrics
 from utils.feature_selection import iterative_feature_pruning
 
+# Remove any existing handlers
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('training.log'),
-        logging.StreamHandler()
+        logging.FileHandler('training.log', mode='w'),  # Use 'w' mode to overwrite previous logs
+        logging.StreamHandler(sys.stdout)
     ]
 )
+
+# Add a filter to prevent duplicate logs
+class DuplicateFilter(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self.last_log = None
+
+    def filter(self, record):
+        current_log = (record.levelno, record.getMessage())
+        if current_log == self.last_log:
+            return False
+        self.last_log = current_log
+        return True
+
+# Add the filter to all handlers
+for handler in logging.root.handlers:
+    handler.addFilter(DuplicateFilter())
 
 def calculate_sample_weights(df: pd.DataFrame, decay_factor: float = 0.1) -> np.ndarray:
     """
@@ -124,8 +146,20 @@ def select_features_by_importance(X: pd.DataFrame, feature_importances: Dict[str
 
 def train_model(df_sales, df_stores):
     """Train a random forest model for revenue prediction."""
+    # Clear any existing logs
+    for handler in logging.root.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.flush()
+    
     logging.info("Starting model training...")
     logging.info(f"Input shapes - Sales: {df_sales.shape}, Stores: {df_stores.shape}")
+    
+    # Validate input data
+    if df_sales.empty or df_stores.empty:
+        raise ValueError("Empty input data provided")
+    
+    if 'revenue' not in df_sales.columns:
+        raise ValueError("Missing 'revenue' column in sales data")
     
     # Analyze revenue distribution
     logging.info("\nRevenue Distribution Analysis:")
@@ -178,200 +212,208 @@ def train_model(df_sales, df_stores):
     logging.info(f"Max: {clean_stats['max']:.2f}")
     logging.info(f"Mean: {clean_stats['mean']:.2f}")
     
-    # Derive features
-    X, features = derive_features(df_sales, df_stores, is_prediction=False)
-    y = df_sales['revenue']
-    
-    # Sort data by date
-    df_sales['date'] = pd.to_datetime(df_sales['date'])
-    date_order = df_sales['date'].values
-    sort_idx = np.argsort(date_order)
-    X = X.iloc[sort_idx]
-    y = y.iloc[sort_idx]
-    store_ids = df_sales['store'].values[sort_idx]
-    
-    # Calculate sample weights
-    sample_weights = calculate_sample_weights(df_sales.iloc[sort_idx])
-    logging.info("Sample weights calculated with log-based decay and day-of-week weighting")
-    
-    # Common model parameters
-    model_params = {
-        'n_estimators': 100,  # Increased from 50 for better feature importance estimation
-        'max_depth': 8,
-        'min_samples_split': 5,
-        'min_samples_leaf': 2,
-        'random_state': 42,
-        'n_jobs': -1,
-        'verbose': 0
-    }
-    
-    # Apply iterative feature pruning
-    logging.info("\nStarting iterative feature pruning...")
-    best_model, selected_features, r2_scores = iterative_feature_pruning(
-        X=X,
-        y=y,
-        model_params=model_params,
-        n_iter=10
-    )
-    
-    # Train final models with selected features
-    models = {}
-    cv_scores = {model_type: [] for model_type in ['median', 'lower', 'upper']}
-    cv_metrics = []
-    
-    # Initialize GroupTimeSeriesSplit
-    n_splits = 5
-    gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
-    
-    # 1. Train median model
-    logging.info("\nTraining median model with selected features...")
-    y_log = np.log1p(y)
-    median_model = RandomForestRegressor(**model_params)
-    
-    for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
-        X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
-        y_train, y_test = y_log[train_idx], y_log[test_idx]
-        weights_train = sample_weights[train_idx]
+    try:
+        # Derive features
+        logging.info("Deriving features...")
+        X, features = derive_features(df_sales, df_stores, is_prediction=False)
+        y = df_sales['revenue']
         
-        median_model.fit(X_train, y_train, sample_weight=weights_train)
-        y_pred = median_model.predict(X_test)
+        logging.info(f"Feature matrix shape: {X.shape}")
+        logging.info(f"Number of features: {len(features)}")
         
-        # Transform predictions and true values back to original scale
-        y_pred_orig = np.expm1(y_pred)
-        y_test_orig = np.expm1(y_test)
+        # Sort data by date
+        df_sales['date'] = pd.to_datetime(df_sales['date'])
+        date_order = df_sales['date'].values
+        sort_idx = np.argsort(date_order)
+        X = X.iloc[sort_idx]
+        y = y.iloc[sort_idx]
+        store_ids = df_sales['store'].values[sort_idx]
         
-        # Calculate R² on original scale
-        score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
-        cv_scores['median'].append(score)
-    
-    # Train final median model on all data
-    median_model.fit(X[selected_features], y_log, sample_weight=sample_weights)
-    models['median'] = median_model
-    
-    # Get feature importances from median model
-    importances = dict(zip(selected_features, median_model.feature_importances_))
-    sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
-    
-    # Select features for lower and upper quantile models
-    X_lower, lower_features = select_features_by_importance(X[selected_features], sorted_importances, 'lower')
-    X_upper, upper_features = select_features_by_importance(X[selected_features], sorted_importances, 'upper')
-    
-    # 2. Train lower tail model
-    logging.info("\nTraining lower tail model...")
-    lower_model = RandomForestRegressor(**model_params)
-    
-    for train_idx, test_idx in gtscv.split(X_lower, groups=store_ids):
-        X_train, X_test = X_lower.iloc[train_idx], X_lower.iloc[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-        weights_train = sample_weights[train_idx]
+        # Calculate sample weights
+        sample_weights = calculate_sample_weights(df_sales.iloc[sort_idx])
+        logging.info("Sample weights calculated with log-based decay and day-of-week weighting")
         
-        lower_model.fit(X_train, y_train, sample_weight=weights_train)
-        y_pred = lower_model.predict(X_test)
-        score = np.corrcoef(y_test, y_pred)[0,1]**2
-        cv_scores['lower'].append(score)
-    
-    lower_model.fit(X_lower, y, sample_weight=sample_weights)
-    models['lower'] = lower_model
-    
-    # 3. Train upper tail model
-    logging.info("\nTraining upper tail model...")
-    upper_model = RandomForestRegressor(**model_params)
-    
-    for train_idx, test_idx in gtscv.split(X_upper, groups=store_ids):
-        X_train, X_test = X_upper.iloc[train_idx], X_upper.iloc[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-        weights_train = sample_weights[train_idx]
+        # Common model parameters
+        model_params = {
+            'n_estimators': 100,  # Increased from 50 for better feature importance estimation
+            'max_depth': 8,
+            'min_samples_split': 5,
+            'min_samples_leaf': 2,
+            'random_state': 42,
+            'n_jobs': -1,
+            'verbose': 0
+        }
         
-        upper_model.fit(X_train, y_train, sample_weight=weights_train)
-        y_pred = upper_model.predict(X_test)
-        score = np.corrcoef(y_test, y_pred)[0,1]**2
-        cv_scores['upper'].append(score)
-    
-    upper_model.fit(X_upper, y, sample_weight=sample_weights)
-    models['upper'] = upper_model
-    
-    # Calculate prediction interval metrics
-    for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
-        X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+        # Apply iterative feature pruning
+        logging.info("\nStarting iterative feature pruning...")
+        best_model, selected_features, r2_scores = iterative_feature_pruning(
+            X=X,
+            y=y,
+            model_params=model_params,
+            n_iter=10
+        )
         
-        # Get predictions for this fold
-        p10 = lower_model.predict(X_test[lower_features])
-        p50 = np.expm1(median_model.predict(X_test[selected_features]))
-        p90 = upper_model.predict(X_test[upper_features])
+        logging.info(f"Selected {len(selected_features)} features after pruning")
         
-        # Calculate metrics
-        fold_metrics = calculate_prediction_metrics(y_test, p10, p50, p90)
-        cv_metrics.append(fold_metrics)
-    
-    # Calculate average metrics
-    avg_metrics = {
-        'coverage': np.mean([m['coverage'] for m in cv_metrics]),
-        'sharpness': np.mean([m['sharpness'] for m in cv_metrics]),
-        'rmse': np.mean([m['rmse'] for m in cv_metrics]),
-        'mae': np.mean([m['mae'] for m in cv_metrics])
-    }
-    
-    # Log cross-validation scores and metrics
-    logging.info("\nCross-validation scores and metrics:")
-    for model_type in ['median', 'lower', 'upper']:
-        mean_score = np.mean(cv_scores[model_type])
-        std_score = np.std(cv_scores[model_type])
-        feature_count = len(selected_features) if model_type == 'median' else len(lower_features if model_type == 'lower' else upper_features)
-        logging.info(f"{model_type} - Mean R²: {mean_score:.3f} (±{std_score:.3f}), Features: {feature_count}")
-    
-    logging.info("\nPrediction Interval Metrics:")
-    logging.info(f"Coverage: {avg_metrics['coverage']:.1f}%")
-    logging.info(f"Sharpness: {avg_metrics['sharpness']:.2f}")
-    logging.info(f"RMSE: {avg_metrics['rmse']:.2f}")
-    logging.info(f"MAE: {avg_metrics['mae']:.2f}")
-    
-    # Save models and features
-    Path('models').mkdir(exist_ok=True)
-    model_path = 'models/brandA_models.pkl'
-    features_path = 'models/brandA_features.json'
-    selected_features_path = 'models/brandA_selected_features.json'
-    feature_names_path = 'models/brandA_feature_names.json'
-    
-    # Save models
-    joblib.dump(models, model_path, compress=3)
-    
-    # Save feature information
-    feature_info = {
-        'all_features': selected_features,
-        'lower_features': lower_features,
-        'upper_features': upper_features
-    }
-    
-    with open(features_path, 'w') as f:
-        json.dump(features, f)
-    with open(selected_features_path, 'w') as f:
-        json.dump(feature_info, f)
-    with open(feature_names_path, 'w') as f:
-        json.dump(feature_info, f)
-    
-    print(f"\nModels saved to: {model_path}")
-    print(f"Features saved to: {features_path}")
-    print(f"Selected features saved to: {selected_features_path}")
-    print(f"Feature names saved to: {feature_names_path}")
-    
-    logging.info("Models and features saved successfully")
-    
-    return {
-        'cv_scores': cv_scores,
-        'feature_importances': sorted_importances,
-        'selected_features': feature_info,
-        'feature_names': feature_info,
-        'train_scores': {
-            'median': np.mean(cv_scores['median']),
-            'lower': np.mean(cv_scores['lower']),
-            'upper': np.mean(cv_scores['upper'])
-        },
-        'test_scores': {
-            'median': np.mean(cv_scores['median']),
-            'lower': np.mean(cv_scores['lower']),
-            'upper': np.mean(cv_scores['upper'])
-        },
-        'prediction_metrics': avg_metrics,
-        'r2_progression': r2_scores
-    }
+        # Train final models with selected features
+        models = {}
+        cv_scores = {model_type: [] for model_type in ['median', 'lower', 'upper']}
+        cv_metrics = []
+        
+        # Initialize GroupTimeSeriesSplit
+        n_splits = 5
+        gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
+        
+        # 1. Train median model
+        logging.info("\nTraining median model with selected features...")
+        y_log = np.log1p(y)
+        median_model = RandomForestRegressor(**model_params)
+        
+        for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
+            X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
+            y_train, y_test = y_log[train_idx], y_log[test_idx]
+            weights_train = sample_weights[train_idx]
+            
+            median_model.fit(X_train, y_train, sample_weight=weights_train)
+            y_pred = median_model.predict(X_test)
+            
+            # Transform predictions and true values back to original scale
+            y_pred_orig = np.expm1(y_pred)
+            y_test_orig = np.expm1(y_test)
+            
+            # Calculate R² on original scale
+            score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
+            cv_scores['median'].append(score)
+        
+        # Train final median model on all data
+        median_model.fit(X[selected_features], y_log, sample_weight=sample_weights)
+        models['median'] = median_model
+        
+        # Get feature importances from median model
+        importances = dict(zip(selected_features, median_model.feature_importances_))
+        sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
+        
+        # Select features for lower and upper quantile models
+        X_lower, lower_features = select_features_by_importance(X[selected_features], sorted_importances, 'lower')
+        X_upper, upper_features = select_features_by_importance(X[selected_features], sorted_importances, 'upper')
+        
+        # 2. Train lower tail model
+        logging.info("\nTraining lower tail model...")
+        lower_model = RandomForestRegressor(**model_params)
+        
+        for train_idx, test_idx in gtscv.split(X_lower, groups=store_ids):
+            X_train, X_test = X_lower.iloc[train_idx], X_lower.iloc[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            weights_train = sample_weights[train_idx]
+            
+            lower_model.fit(X_train, y_train, sample_weight=weights_train)
+            y_pred = lower_model.predict(X_test)
+            score = np.corrcoef(y_test, y_pred)[0,1]**2
+            cv_scores['lower'].append(score)
+        
+        lower_model.fit(X_lower, y, sample_weight=sample_weights)
+        models['lower'] = lower_model
+        
+        # 3. Train upper tail model
+        logging.info("\nTraining upper tail model...")
+        upper_model = RandomForestRegressor(**model_params)
+        
+        for train_idx, test_idx in gtscv.split(X_upper, groups=store_ids):
+            X_train, X_test = X_upper.iloc[train_idx], X_upper.iloc[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            weights_train = sample_weights[train_idx]
+            
+            upper_model.fit(X_train, y_train, sample_weight=weights_train)
+            y_pred = upper_model.predict(X_test)
+            score = np.corrcoef(y_test, y_pred)[0,1]**2
+            cv_scores['upper'].append(score)
+        
+        upper_model.fit(X_upper, y, sample_weight=sample_weights)
+        models['upper'] = upper_model
+        
+        # Calculate prediction interval metrics
+        for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
+            X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            
+            # Get predictions for this fold
+            p10 = lower_model.predict(X_test[lower_features])
+            p50 = np.expm1(median_model.predict(X_test[selected_features]))
+            p90 = upper_model.predict(X_test[upper_features])
+            
+            # Calculate metrics
+            fold_metrics = calculate_prediction_metrics(y_test, p10, p50, p90)
+            cv_metrics.append(fold_metrics)
+        
+        # Calculate average metrics
+        avg_metrics = {
+            'coverage': np.mean([m['coverage'] for m in cv_metrics]),
+            'sharpness': np.mean([m['sharpness'] for m in cv_metrics]),
+            'rmse': np.mean([m['rmse'] for m in cv_metrics]),
+            'mae': np.mean([m['mae'] for m in cv_metrics])
+        }
+        
+        # Log cross-validation scores and metrics
+        logging.info("\nCross-validation scores and metrics:")
+        for model_type in ['median', 'lower', 'upper']:
+            mean_score = np.mean(cv_scores[model_type])
+            std_score = np.std(cv_scores[model_type])
+            feature_count = len(selected_features) if model_type == 'median' else len(lower_features if model_type == 'lower' else upper_features)
+            logging.info(f"{model_type} - Mean R²: {mean_score:.3f} (±{std_score:.3f}), Features: {feature_count}")
+        
+        logging.info("\nPrediction Interval Metrics:")
+        logging.info(f"Coverage: {avg_metrics['coverage']:.1f}%")
+        logging.info(f"Sharpness: {avg_metrics['sharpness']:.2f}")
+        logging.info(f"RMSE: {avg_metrics['rmse']:.2f}")
+        logging.info(f"MAE: {avg_metrics['mae']:.2f}")
+        
+        # Save models and features
+        Path('models').mkdir(exist_ok=True)
+        model_path = 'models/brandA_models.pkl'
+        features_path = 'models/brandA_features.json'
+        selected_features_path = 'models/brandA_selected_features.json'
+        feature_names_path = 'models/brandA_feature_names.json'
+        
+        # Save models
+        joblib.dump(models, model_path, compress=3)
+        
+        # Save feature information
+        feature_info = {
+            'all_features': selected_features,
+            'lower_features': lower_features,
+            'upper_features': upper_features
+        }
+        
+        with open(features_path, 'w') as f:
+            json.dump(features, f)
+        with open(selected_features_path, 'w') as f:
+            json.dump(feature_info, f)
+        with open(feature_names_path, 'w') as f:
+            json.dump(feature_info, f)
+        
+        logging.info("Models and features saved successfully")
+        
+        return {
+            'cv_scores': cv_scores,
+            'feature_importances': sorted_importances,
+            'selected_features': feature_info,
+            'feature_names': feature_info,
+            'train_scores': {
+                'median': np.mean(cv_scores['median']),
+                'lower': np.mean(cv_scores['lower']),
+                'upper': np.mean(cv_scores['upper'])
+            },
+            'test_scores': {
+                'median': np.mean(cv_scores['median']),
+                'lower': np.mean(cv_scores['lower']),
+                'upper': np.mean(cv_scores['upper'])
+            },
+            'prediction_metrics': avg_metrics,
+            'r2_progression': r2_scores
+        }
+    except Exception as e:
+        logging.error(f"Error during model training: {str(e)}")
+        logging.error("Full traceback:")
+        import traceback
+        logging.error(traceback.format_exc())
+        raise

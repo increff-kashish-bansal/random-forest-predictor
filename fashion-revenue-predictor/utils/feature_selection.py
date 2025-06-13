@@ -285,132 +285,226 @@ def get_common_features(
     logging.info(f"Found {len(common_features)} common features across clusters")
     return common_features
 
-def remove_correlated_features(X: pd.DataFrame, threshold: float = 0.95) -> Tuple[pd.DataFrame, List[str]]:
+def remove_correlated_features(X: pd.DataFrame, threshold: float = 0.95) -> List[str]:
     """
-    Remove highly correlated features to reduce redundancy.
+    Remove highly correlated features.
     
     Args:
-        X: Feature DataFrame
-        threshold: Correlation threshold (features with correlation above this will be considered redundant)
+        X: Feature matrix
+        threshold: Correlation threshold
         
     Returns:
-        Tuple of (filtered DataFrame, list of removed feature names)
+        List of feature names to keep
     """
-    logging.info(f"Starting correlation analysis with threshold {threshold}...")
-    
-    # Calculate correlation matrix
+    logging.info("Calculating correlation matrix...")
     corr_matrix = X.corr().abs()
     
     # Get upper triangle of correlation matrix
     upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
     
-    # Find features with correlation above threshold
-    to_drop = []
-    for column in upper.columns:
-        if any(upper[column] > threshold):
-            # Find the feature with the highest correlation
-            correlated_features = upper[column][upper[column] > threshold].index.tolist()
-            if correlated_features:
-                # Keep the feature with the highest variance
-                variances = X[correlated_features + [column]].var()
-                feature_to_keep = variances.idxmax()
-                features_to_drop = [f for f in correlated_features + [column] if f != feature_to_keep]
-                to_drop.extend(features_to_drop)
-    
-    # Remove duplicates while preserving order
-    to_drop = list(dict.fromkeys(to_drop))
+    # Find features to drop
+    to_drop = [column for column in upper.columns if any(upper[column] > threshold)]
     
     if to_drop:
-        logging.info(f"Removing {len(to_drop)} highly correlated features")
-        logging.info(f"Removed features: {to_drop}")
-        
-        # Create correlation report for removed features
-        corr_report = []
-        for feature in to_drop:
-            # Find the feature it was most correlated with
-            correlations = corr_matrix[feature].sort_values(ascending=False)
-            most_correlated = correlations.index[1]  # Skip self-correlation
-            corr_value = correlations.iloc[1]
-            corr_report.append(f"{feature} (corr={corr_value:.3f} with {most_correlated})")
-        
-        logging.info("Correlation report for removed features:")
-        for report in corr_report:
-            logging.info(f"- {report}")
+        logging.info(f"Found {len(to_drop)} highly correlated features to remove")
+        for feat in to_drop:
+            corr_feats = upper[feat][upper[feat] > threshold].index.tolist()
+            if corr_feats:
+                logging.info(f"Feature '{feat}' is highly correlated with: {', '.join(corr_feats)}")
     
-    # Return the original DataFrame with the same columns as X_clean
-    return X.drop(columns=to_drop), to_drop
+    # Return features to keep
+    return [col for col in X.columns if col not in to_drop]
 
-def iterative_feature_pruning(X: pd.DataFrame, y: np.ndarray, model_params: Dict, n_iter: int = 5) -> Tuple[RandomForestRegressor, List[str], List[float]]:
+def remove_high_vif_features(X: pd.DataFrame, threshold: float = 5.0) -> List[str]:
     """
-    Iteratively prune features based on importance and correlation.
+    Remove features with high Variance Inflation Factor (VIF).
+    Handles one-hot encoded categorical variables by grouping them.
     
     Args:
         X: Feature matrix
-        y: Target values
+        threshold: VIF threshold
+        
+    Returns:
+        List of feature names to keep
+    """
+    logging.info("Calculating VIF values...")
+    
+    # Identify numeric and categorical columns
+    numeric_cols = []
+    categorical_cols = []
+    categorical_groups = {}
+    
+    for col in X.columns:
+        if np.issubdtype(X[col].dtype, np.number):
+            # Check if this is a one-hot encoded column
+            if '_' in col and any(col.startswith(prefix) for prefix in ['city_', 'region_', 'channel_']):
+                prefix = col.split('_')[0]
+                if prefix not in categorical_groups:
+                    categorical_groups[prefix] = []
+                categorical_groups[prefix].append(col)
+            else:
+                numeric_cols.append(col)
+        else:
+            categorical_cols.append(col)
+            logging.info(f"Skipping VIF calculation for categorical column: {col}")
+    
+    if not numeric_cols:
+        logging.info("No numeric columns found for VIF calculation")
+        return X.columns.tolist()
+    
+    # Process only numeric columns
+    X_numeric = X[numeric_cols].copy()
+    
+    # Handle infinite values
+    X_numeric = X_numeric.replace([np.inf, -np.inf], np.nan)
+    
+    # Fill NaN values with column means
+    X_numeric = X_numeric.fillna(X_numeric.mean())
+    
+    # Verify data is valid
+    if not np.all(np.isfinite(X_numeric.values)):
+        logging.error("Data still contains non-finite values after cleaning")
+        return X.columns.tolist()
+    
+    try:
+        vif_data = pd.DataFrame()
+        vif_data["Variable"] = X_numeric.columns
+        vif_data["VIF"] = [variance_inflation_factor(X_numeric.values, i) for i in range(X_numeric.shape[1])]
+        
+        # Sort by VIF
+        vif_data = vif_data.sort_values('VIF', ascending=False)
+        
+        # Log VIF values
+        logging.info("\nTop 10 highest VIF values:")
+        for _, row in vif_data.head(10).iterrows():
+            logging.info(f"{row['Variable']}: {row['VIF']:.2f}")
+        
+        # Remove features with high VIF
+        to_keep_numeric = vif_data[vif_data["VIF"] <= threshold]["Variable"].tolist()
+        removed = len(X_numeric.columns) - len(to_keep_numeric)
+        
+        if removed > 0:
+            logging.info(f"Removed {removed} numeric features with high VIF")
+            removed_features = [col for col in X_numeric.columns if col not in to_keep_numeric]
+            logging.info("Removed features:")
+            for feat in removed_features:
+                vif = vif_data[vif_data["Variable"] == feat]["VIF"].values[0]
+                logging.info(f"- {feat}: VIF = {vif:.2f}")
+        
+        # Handle categorical groups
+        to_keep_categorical = []
+        for prefix, cols in categorical_groups.items():
+            # Keep at least one column from each categorical group
+            if any(col in to_keep_numeric for col in cols):
+                to_keep_categorical.extend([col for col in cols if col in to_keep_numeric])
+            else:
+                # If none of the columns are kept, keep the most frequent one
+                most_frequent = X[cols].sum().idxmax()
+                to_keep_categorical.append(most_frequent)
+                logging.info(f"Keeping most frequent category for {prefix}: {most_frequent}")
+        
+        # Combine kept numeric features with categorical features
+        to_keep = to_keep_numeric + to_keep_categorical + categorical_cols
+        return to_keep
+        
+    except Exception as e:
+        logging.error(f"Error calculating VIF: {str(e)}")
+        logging.info("Skipping VIF-based feature removal")
+        return X.columns.tolist()
+
+def iterative_feature_pruning(X: pd.DataFrame, y: pd.Series, model_params: dict, n_iter: int = 10) -> Tuple[RandomForestRegressor, List[str], List[float]]:
+    """
+    Iteratively prune features using multiple methods.
+    
+    Args:
+        X: Feature matrix
+        y: Target variable
         model_params: Parameters for RandomForestRegressor
-        n_iter: Number of pruning iterations
+        n_iter: Number of iterations
         
     Returns:
         Tuple of (best model, selected features, R² scores)
     """
-    logging.info("Starting iterative feature pruning...")
+    logging.info(f"\nStarting iterative feature pruning with {X.shape[1]} initial features...")
     
-    # Initialize variables
-    current_features = X.columns.tolist()
-    r2_scores = []
-    best_r2 = -np.inf
+    # Ensure target variable is numeric
+    if not np.issubdtype(y.dtype, np.number):
+        logging.warning("Converting target variable to numeric")
+        y = pd.to_numeric(y, errors='coerce')
+    
+    # Handle infinite values in target
+    y = pd.Series(y).replace([np.inf, -np.inf], np.nan)
+    
+    # Fill NaN values in target with median
+    y = y.fillna(y.median())
+    
     best_model = None
+    best_score = -np.inf
     best_features = None
+    r2_scores = []
+    
+    # Get initial feature set
+    current_features = X.columns.tolist()
     
     for i in range(n_iter):
         logging.info(f"\nIteration {i+1}/{n_iter}")
         logging.info(f"Current feature count: {len(current_features)}")
         
-        # 1. Remove highly correlated features
-        X_uncorr, removed_corr = remove_correlated_features(X[current_features], threshold=0.95)
-        current_features = X_uncorr.columns.tolist()
-        logging.info(f"Features after correlation pruning: {len(current_features)}")
-        
-        # 2. Remove features with high VIF
-        X_low_vif, removed_vif = remove_high_vif(X_uncorr, threshold=5.0)
-        current_features = X_low_vif.columns.tolist()
-        logging.info(f"Features after VIF pruning: {len(current_features)}")
-        
-        # 3. Train model and get feature importance
-        model = RandomForestRegressor(**model_params)
-        model.fit(X_low_vif, y)
-        
-        # Calculate R² score
-        r2 = model.score(X_low_vif, y)
-        r2_scores.append(r2)
-        logging.info(f"R² score: {r2:.4f}")
-        
-        # Update best model if current is better
-        if r2 > best_r2:
-            best_r2 = r2
-            best_model = model
-            best_features = current_features.copy()
-            logging.info("New best model found!")
-        
-        # 4. Remove least important features
-        importances = pd.Series(model.feature_importances_, index=current_features)
-        importances = importances.sort_values(ascending=False)
-        
-        # Remove bottom 10% of features
-        n_to_remove = max(1, int(len(current_features) * 0.1))
-        removed_features = importances.tail(n_to_remove).index.tolist()
-        current_features = importances.head(len(current_features) - n_to_remove).index.tolist()
-        
-        logging.info(f"Removed {n_to_remove} least important features")
-        logging.info(f"Remaining features: {len(current_features)}")
-        
-        # Stop if we've removed too many features
-        if len(current_features) < 10:
-            logging.info("Stopping early due to too few features remaining")
-            break
+        try:
+            # 1. Remove highly correlated features
+            logging.info("Starting correlation analysis with threshold 0.95...")
+            X_current = X[current_features]
+            current_features = remove_correlated_features(X_current, threshold=0.95)
+            logging.info(f"Features after correlation pruning: {len(current_features)}")
+            
+            # 2. Remove features with high VIF (only for numeric features)
+            logging.info("Starting VIF analysis...")
+            X_current = X[current_features]
+            current_features = remove_high_vif_features(X_current, threshold=5.0)
+            logging.info(f"Features after VIF pruning: {len(current_features)}")
+            
+            # 3. Train model and evaluate
+            logging.info("Training model with current feature set...")
+            model = RandomForestRegressor(**model_params)
+            model.fit(X[current_features], y)
+            
+            # Calculate R² score
+            y_pred = model.predict(X[current_features])
+            score = np.corrcoef(y, y_pred)[0,1]**2
+            r2_scores.append(score)
+            logging.info(f"R² score: {score:.4f}")
+            
+            # Update best model if current score is better
+            if score > best_score:
+                logging.info("New best model found!")
+                best_score = score
+                best_model = model
+                best_features = current_features.copy()
+            
+            # 4. Remove least important features
+            if len(current_features) > 10:  # Keep at least 10 features
+                importances = dict(zip(current_features, model.feature_importances_))
+                sorted_features = sorted(importances.items(), key=lambda x: x[1])
+                n_to_remove = max(1, len(current_features) // 10)  # Remove 10% of features each iteration
+                features_to_remove = [f[0] for f in sorted_features[:n_to_remove]]
+                current_features = [f for f in current_features if f not in features_to_remove]
+                logging.info(f"Removed {n_to_remove} least important features")
+                logging.info(f"Remaining features: {len(current_features)}")
+            else:
+                logging.info("Reached minimum feature threshold, stopping feature removal")
+                break
+                
+        except Exception as e:
+            logging.error(f"Error in iteration {i+1}: {str(e)}")
+            logging.info("Continuing with current feature set")
+            continue
+    
+    if best_model is None:
+        logging.error("No valid model was found during feature pruning")
+        return None, X.columns.tolist(), []
     
     logging.info("\nFeature pruning complete")
     logging.info(f"Final feature count: {len(best_features)}")
-    logging.info(f"Best R² score: {best_r2:.4f}")
+    logging.info(f"Best R² score: {best_score:.4f}")
     
     return best_model, best_features, r2_scores 
