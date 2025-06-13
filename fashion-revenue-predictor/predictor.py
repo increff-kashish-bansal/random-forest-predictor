@@ -89,6 +89,11 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     # Get top 5 features
     top_5_features = list(sorted_importance.items())[:5]
     
+    # After all calibration and sorting, invert log1p transformation for all predictions
+    p10 = np.expm1(p10)
+    p50 = np.expm1(p50)
+    p90 = np.expm1(p90)
+    
     return {
         'p10': p10,
         'p50': p50,

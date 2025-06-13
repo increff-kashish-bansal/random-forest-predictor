@@ -203,6 +203,17 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         'day_of_week_sin', 'day_of_week_cos', 'month_sin', 'month_cos'
     ])
     
+    # --- Weekday × Store Interactions ---
+    # Ordinal encoding: store_id may be string, so encode as categorical codes
+    if 'store' in df.columns and 'day_of_week' in df.columns:
+        df['store_id_ord'] = pd.Categorical(df['store']).codes
+        df['weekday_store_ord'] = df['day_of_week'] * 10000 + df['store_id_ord']
+        features.append('weekday_store_ord')
+        # One-hot encoding for (store, weekday) pairs
+        weekday_store_ohe = pd.get_dummies(df['day_of_week'].astype(str) + '_' + df['store'].astype(str), prefix='wdst')
+        df = pd.concat([df, weekday_store_ohe], axis=1)
+        features.extend(list(weekday_store_ohe.columns))
+    
     # 2. Store/Location Features
     logging.info("Generating store/location features...")
     
@@ -444,6 +455,25 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
             'revenue_volatility_3d'
         ]
         features.extend(stability_features)
+        
+        # Add revenue_lag_7_percentile: percentile rank of revenue 7 days ago in the last 30 days per store
+        def lag_7_percentile(x):
+            # For each row, compute the percentile rank of revenue_lag_7 among the last 30 days
+            rev = x['revenue'].values
+            lag_7 = pd.Series(rev).shift(7)
+            percentiles = []
+            for i in range(len(x)):
+                if i < 30 or pd.isna(lag_7.iloc[i]):
+                    percentiles.append(np.nan)
+                else:
+                    window = rev[max(0, i-30):i]
+                    if len(window) == 0 or pd.isna(lag_7.iloc[i]):
+                        percentiles.append(np.nan)
+                    else:
+                        percentiles.append((window < lag_7.iloc[i]).sum() / len(window))
+            return pd.Series(percentiles, index=x.index)
+        df['revenue_lag_7_percentile'] = df.groupby('store', group_keys=False).apply(lag_7_percentile)
+        features.append('revenue_lag_7_percentile')
         
     else:
         # During prediction, load store stats
@@ -725,5 +755,50 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     
     # Remove any duplicate features that might have been created
     features = list(dict.fromkeys(features))
+    
+    # --- FIXED: Use transform for index alignment ---
+    # region_weekday_volatility: std of past 4-week revenue by region and weekday
+    def region_weekday_volatility_transform(x):
+        return x.rolling(window=28, min_periods=1).std().shift(1)
+    df['region_weekday_volatility'] = df.groupby(['region', 'day_of_week'])['revenue'].transform(region_weekday_volatility_transform)
+    features.append('region_weekday_volatility')
+
+    # time_since_last_peak_revenue: days since last revenue > 90th percentile per store
+    def time_since_last_peak_transform(rev):
+        pct90 = rev.expanding().quantile(0.9)
+        last_peak_idx = -1 * np.ones(len(rev), dtype=int)
+        days_since = np.zeros(len(rev), dtype=int)
+        for i in range(len(rev)):
+            if i == 0:
+                days_since[i] = 0
+            else:
+                if rev.iloc[i-1] > pct90.iloc[i-1]:
+                    last_peak_idx[i] = i-1
+                else:
+                    last_peak_idx[i] = last_peak_idx[i-1]
+                if last_peak_idx[i] == -1:
+                    days_since[i] = i
+                else:
+                    days_since[i] = i - last_peak_idx[i]
+        return pd.Series(days_since, index=rev.index)
+    df['time_since_last_peak_revenue'] = df.groupby('store')['revenue'].transform(time_since_last_peak_transform)
+    features.append('time_since_last_peak_revenue')
+
+    # revenue_lag_7_percentile: percentile rank of revenue 7 days ago in the last 30 days per store
+    def lag_7_percentile_transform(rev):
+        lag_7 = rev.shift(7)
+        percentiles = []
+        for i in range(len(rev)):
+            if i < 30 or pd.isna(lag_7.iloc[i]):
+                percentiles.append(np.nan)
+            else:
+                window = rev.iloc[max(0, i-30):i]
+                if len(window) == 0 or pd.isna(lag_7.iloc[i]):
+                    percentiles.append(np.nan)
+                else:
+                    percentiles.append((window < lag_7.iloc[i]).sum() / len(window))
+        return pd.Series(percentiles, index=rev.index)
+    df['revenue_lag_7_percentile'] = df.groupby('store')['revenue'].transform(lag_7_percentile_transform)
+    features.append('revenue_lag_7_percentile')
     
     return X, features

@@ -215,10 +215,12 @@ def train_model(df_sales, df_stores):
     logging.info(f"Mean: {clean_stats['mean']:.2f}")
     
     try:
+        # Transform target variable to log1p for all model training
+        y = np.log1p(df_sales['revenue'])
+
         # Derive features
         logging.info("Deriving features...")
         X, features = derive_features(df_sales, df_stores, is_prediction=False)
-        y = df_sales['revenue']
         
         logging.info(f"Feature matrix shape: {X.shape}")
         logging.info(f"Number of features: {len(features)}")
@@ -234,9 +236,6 @@ def train_model(df_sales, df_stores):
         # Calculate sample weights
         sample_weights = calculate_sample_weights(df_sales.iloc[sort_idx])
         logging.info("Sample weights calculated with log-based decay and day-of-week weighting")
-
-        # Define y_log before any use
-        y_log = np.log1p(y)
 
         # Common model parameters
         model_params = {
@@ -337,7 +336,7 @@ def train_model(df_sales, df_stores):
             return best_params
         # Tune or use defaults
         try:
-            best_lgb_params = tune_lgbm(X[selected_features], y_log, store_ids, sample_weights)
+            best_lgb_params = tune_lgbm(X[selected_features], y, store_ids, sample_weights)
             logging.info(f"Optuna best LightGBM params: {best_lgb_params}")
         except Exception as e:
             logging.warning(f"Optuna tuning failed or not available, using defaults. Error: {e}")
@@ -349,7 +348,7 @@ def train_model(df_sales, df_stores):
         median_model = lgb.LGBMRegressor(**lgb_median_params, n_estimators=100)
         for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
             X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
-            y_train, y_test = y_log[train_idx], y_log[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
             weights_train = sample_weights[train_idx]
             median_model.fit(
                 X_train, y_train,
@@ -364,9 +363,9 @@ def train_model(df_sales, df_stores):
             score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
             cv_scores['median'].append(score)
         median_model.fit(
-            X[selected_features], y_log,
+            X[selected_features], y,
             sample_weight=sample_weights,
-            eval_set=[(X[selected_features], y_log)],
+            eval_set=[(X[selected_features], y)],
             eval_sample_weight=[sample_weights],
             callbacks=[lgb.early_stopping(50, verbose=False)]
         )
