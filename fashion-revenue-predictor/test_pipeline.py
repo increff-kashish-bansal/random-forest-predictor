@@ -107,6 +107,15 @@ def test_prediction(df_sales, df_stores):
         
         logging.info(f"Testing prediction for store {store_id} on {future_date}")
         
+        # Get last 7 days of historical sales for this store
+        historical_sales = df_sales[
+            (df_sales['store'] == store_id) & 
+            (df_sales['date'] >= future_date - timedelta(days=7)) &
+            (df_sales['date'] < future_date)
+        ].copy()
+        
+        logging.info(f"Found {len(historical_sales)} days of historical sales data")
+        
         # Create synthetic sales row
         synthetic_sales = pd.DataFrame({
             'store': [store_id],
@@ -129,8 +138,8 @@ def test_prediction(df_sales, df_stores):
             'is_online': [store_meta['is_online']]
         })
         
-        # Derive features
-        X_pred, _ = derive_features(synthetic_sales, synthetic_stores, is_prediction=True)
+        # Derive features with historical data
+        X_pred, _ = derive_features(synthetic_sales, synthetic_stores, historical_sales=historical_sales, is_prediction=True)
         
         # Make prediction
         results = predict_and_explain(X_pred)

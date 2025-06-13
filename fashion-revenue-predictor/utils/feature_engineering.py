@@ -19,13 +19,14 @@ logging.basicConfig(
     ]
 )
 
-def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_prediction: bool = False) -> Tuple[pd.DataFrame, List[str]]:
+def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_sales: pd.DataFrame = None, is_prediction: bool = False) -> Tuple[pd.DataFrame, List[str]]:
     """
     Derive features from sales and stores data.
     
     Args:
         df_sales: DataFrame with sales data
         df_stores: DataFrame with store information
+        historical_sales: DataFrame with historical sales data for lag features (optional)
         is_prediction: Whether this is being called for prediction (single row) or training
         
     Returns:
@@ -36,17 +37,25 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_predicti
     
     logging.info("Starting feature engineering...")
     logging.info(f"Input shapes - Sales: {df_sales.shape}, Stores: {df_stores.shape}")
+    if historical_sales is not None:
+        logging.info(f"Historical sales shape: {historical_sales.shape}")
     
     # Ensure date is datetime
     df_sales['date'] = pd.to_datetime(df_sales['date'])
+    if historical_sales is not None:
+        historical_sales['date'] = pd.to_datetime(historical_sales['date'])
     
     # Ensure store IDs are strings and validate
     df_sales['store'] = df_sales['store'].astype(str)
     df_stores['id'] = df_stores['id'].astype(str)
+    if historical_sales is not None:
+        historical_sales['store'] = historical_sales['store'].astype(str)
     
     # Log store IDs for debugging
     logging.info(f"Sales store IDs: {df_sales['store'].unique()}")
     logging.info(f"Stores IDs: {df_stores['id'].unique()}")
+    if historical_sales is not None:
+        logging.info(f"Historical sales store IDs: {historical_sales['store'].unique()}")
     
     # Validate required columns
     required_sales_cols = ['store', 'date', 'qty_sold', 'revenue', 'disc_perc']
@@ -59,6 +68,10 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_predicti
         raise ValueError(f"Missing required columns in sales data: {missing_sales_cols}")
     if missing_stores_cols:
         raise ValueError(f"Missing required columns in stores data: {missing_stores_cols}")
+    if historical_sales is not None:
+        missing_hist_cols = [col for col in required_sales_cols if col not in historical_sales.columns]
+        if missing_hist_cols:
+            raise ValueError(f"Missing required columns in historical sales data: {missing_hist_cols}")
     
     # Merge store data
     df = pd.merge(df_sales, df_stores, left_on='store', right_on='id', how='left')
@@ -270,34 +283,31 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_predicti
         with open('models/lag_params.json', 'w') as f:
             json.dump(lag_params, f)
     else:
-        # During prediction, load lag parameters
-        try:
-            with open('models/lag_params.json', 'r') as f:
-                lag_params = json.load(f)
+        # During prediction, use historical sales data if available
+        if historical_sales is not None:
+            # Combine historical and current data
+            combined_sales = pd.concat([historical_sales, df_sales])
+            combined_sales = combined_sales.sort_values(['store', 'date'])
             
-            # Sort by store and date
-            df = df.sort_values(['store', 'date'])
+            # Calculate lag features using combined data
+            df['lag_1'] = combined_sales.groupby('store')['revenue'].shift(1).iloc[-len(df):]
+            df['lag_7'] = combined_sales.groupby('store')['revenue'].shift(7).iloc[-len(df):]
             
-            # Calculate lag features
-            df['lag_1'] = df.groupby('store')['revenue'].shift(1)
-            df['lag_7'] = df.groupby('store')['revenue'].shift(7)
-            
-            # Calculate rolling means
-            df['rolling_mean_7d'] = df.groupby('store')['revenue'].transform(
+            # Calculate rolling means using combined data
+            df['rolling_mean_7d'] = combined_sales.groupby('store')['revenue'].transform(
                 lambda x: x.rolling(7, min_periods=1).mean()
-            )
-            df['rolling_mean_30d'] = df.groupby('store')['revenue'].transform(
+            ).iloc[-len(df):]
+            df['rolling_mean_30d'] = combined_sales.groupby('store')['revenue'].transform(
                 lambda x: x.rolling(30, min_periods=1).mean()
-            )
-            
-            # Add lag features to feature list
-            features.extend(['lag_1', 'lag_7', 'rolling_mean_7d', 'rolling_mean_30d'])
-        except FileNotFoundError:
-            # If no lag parameters available, use zeros
+            ).iloc[-len(df):]
+        else:
+            # If no historical data available, use zeros
             lag_features = ['lag_1', 'lag_7', 'rolling_mean_7d', 'rolling_mean_30d']
             for feature in lag_features:
                 df[feature] = 0
-            features.extend(lag_features)
+        
+        # Add lag features to feature list
+        features.extend(['lag_1', 'lag_7', 'rolling_mean_7d', 'rolling_mean_30d'])
     
     # Fill NaN values in lag features with 0
     lag_features = ['lag_1', 'lag_7', 'rolling_mean_7d', 'rolling_mean_30d']
