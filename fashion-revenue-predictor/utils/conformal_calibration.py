@@ -60,28 +60,14 @@ class ConformalCalibrator:
         p10: np.ndarray,
         p50: np.ndarray,
         p90: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[float, float]:
         """
         Calculate adjustments for prediction bounds based on nonconformity scores.
-        
-        Args:
-            scores: Nonconformity scores
-            p10: 10th percentile predictions
-            p50: 50th percentile predictions
-            p90: 90th percentile predictions
-            
-        Returns:
-            Tuple of (lower_adjustments, upper_adjustments)
+        Returns scalar adjustments.
         """
         # Calculate empirical quantile of scores
         score_quantile = np.quantile(scores, 1 - self.alpha)
-        
-        # Calculate adjustments to maintain coverage
-        interval_width = p90 - p10
-        lower_adjustments = score_quantile * interval_width
-        upper_adjustments = score_quantile * interval_width
-        
-        return lower_adjustments, upper_adjustments
+        return score_quantile, score_quantile
     
     def calibrate(
         self,
@@ -119,22 +105,11 @@ class ConformalCalibrator:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Apply calibration to new predictions.
-        
-        Args:
-            p10: 10th percentile predictions
-            p50: 50th percentile predictions
-            p90: 90th percentile predictions
-            
-        Returns:
-            Tuple of calibrated (p10, p50, p90) arrays
         """
         if self.quantile_adjustments is None:
             raise ValueError("Calibrator must be fitted before making predictions")
-        
-        lower_adjustments, upper_adjustments = self.quantile_adjustments
-        
-        # Apply adjustments while maintaining sharpness
-        p10_calibrated = p10 - lower_adjustments
-        p90_calibrated = p90 + upper_adjustments
-        
+        lower_adjustment, upper_adjustment = self.quantile_adjustments
+        interval_width = p90 - p10
+        p10_calibrated = p10 - lower_adjustment * interval_width
+        p90_calibrated = p90 + upper_adjustment * interval_width
         return p10_calibrated, p50, p90_calibrated 
