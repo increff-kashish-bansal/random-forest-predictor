@@ -14,6 +14,7 @@ import joblib
 from sklearn.preprocessing import OneHotEncoder
 from predictor import calculate_prediction_metrics
 from utils.feature_selection import iterative_feature_pruning, select_features_by_global_shap
+import lightgbm as lgb
 
 # Remove any existing handlers
 for handler in logging.root.handlers[:]:
@@ -279,74 +280,67 @@ def train_model(df_sales, df_stores):
         # 1. Train median model
         logging.info("\nTraining median model with selected features...")
         y_log = np.log1p(y)
-        median_model = RandomForestRegressor(**model_params)
-        
+        lgb_median_params = {
+            'objective': 'quantile',
+            'alpha': 0.5,
+            'metric': 'quantile',
+            'boosting_type': 'gbdt',
+            'num_leaves': 31,
+            'learning_rate': 0.05,
+            'feature_fraction': 0.9,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 5,
+            'verbose': -1,
+            'seed': 42
+        }
+        median_model = lgb.LGBMRegressor(**lgb_median_params, n_estimators=100)
         for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
             X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
             y_train, y_test = y_log[train_idx], y_log[test_idx]
             weights_train = sample_weights[train_idx]
-            
             median_model.fit(X_train, y_train, sample_weight=weights_train)
             y_pred = median_model.predict(X_test)
-            
-            # Transform predictions and true values back to original scale
             y_pred_orig = np.expm1(y_pred)
             y_test_orig = np.expm1(y_test)
-            
-            # Calculate R² on original scale
             score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
             cv_scores['median'].append(score)
-        
-        # Train final median model on all data
         median_model.fit(X[selected_features], y_log, sample_weight=sample_weights)
         models['median'] = median_model
-        
-        # Get median predictions for residual calculation
         median_preds = np.expm1(median_model.predict(X[selected_features]))
-        
-        # Calculate residuals for lower and upper quantile models
-        lower_targets = np.clip(median_preds - y, 0, None)  # Positive residuals for lower bound
-        upper_targets = np.clip(y - median_preds, 0, None)  # Positive residuals for upper bound
-        
-        # Get feature importances from median model
+        lower_targets = np.clip(median_preds - y, 0, None)
+        upper_targets = np.clip(y - median_preds, 0, None)
         importances = dict(zip(selected_features, median_model.feature_importances_))
         sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
-        
-        # Select features for lower and upper quantile models
         X_lower, lower_features = select_features_by_importance(X[selected_features], sorted_importances, 'lower')
         X_upper, upper_features = select_features_by_importance(X[selected_features], sorted_importances, 'upper')
-        
         # 2. Train lower tail model on residuals
-        logging.info("\nTraining lower tail model on residuals...")
-        lower_model = RandomForestRegressor(**model_params)
-        
+        logging.info("\nTraining lower tail model with LightGBM quantile regression...")
+        lgb_lower_params = lgb_median_params.copy()
+        lgb_lower_params['alpha'] = 0.1
+        lower_model = lgb.LGBMRegressor(**lgb_lower_params, n_estimators=100)
         for train_idx, test_idx in gtscv.split(X_lower, groups=store_ids):
             X_train, X_test = X_lower.iloc[train_idx], X_lower.iloc[test_idx]
             y_train, y_test = lower_targets[train_idx], lower_targets[test_idx]
             weights_train = sample_weights[train_idx]
-            
             lower_model.fit(X_train, y_train, sample_weight=weights_train)
             y_pred = lower_model.predict(X_test)
             score = np.corrcoef(y_test, y_pred)[0,1]**2
             cv_scores['lower'].append(score)
-        
         lower_model.fit(X_lower, lower_targets, sample_weight=sample_weights)
         models['lower'] = lower_model
-        
         # 3. Train upper tail model on residuals
-        logging.info("\nTraining upper tail model on residuals...")
-        upper_model = RandomForestRegressor(**model_params)
-        
+        logging.info("\nTraining upper tail model with LightGBM quantile regression...")
+        lgb_upper_params = lgb_median_params.copy()
+        lgb_upper_params['alpha'] = 0.9
+        upper_model = lgb.LGBMRegressor(**lgb_upper_params, n_estimators=100)
         for train_idx, test_idx in gtscv.split(X_upper, groups=store_ids):
             X_train, X_test = X_upper.iloc[train_idx], X_upper.iloc[test_idx]
             y_train, y_test = upper_targets[train_idx], upper_targets[test_idx]
             weights_train = sample_weights[train_idx]
-            
             upper_model.fit(X_train, y_train, sample_weight=weights_train)
             y_pred = upper_model.predict(X_test)
             score = np.corrcoef(y_test, y_pred)[0,1]**2
             cv_scores['upper'].append(score)
-        
         upper_model.fit(X_upper, upper_targets, sample_weight=sample_weights)
         models['upper'] = upper_model
         
