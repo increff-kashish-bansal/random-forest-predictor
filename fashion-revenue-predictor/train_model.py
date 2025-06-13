@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Tuple
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import TimeSeriesSplit
+from utils.custom_cv import GroupTimeSeriesSplit
 from utils.feature_engineering import derive_features
 from scipy.stats import boxcox
 import joblib
@@ -135,14 +135,15 @@ def train_model(df_sales, df_stores):
     sort_idx = np.argsort(date_order)
     X = X.iloc[sort_idx]
     y = y[sort_idx]
+    store_ids = df_sales['store'].values[sort_idx]  # Get store IDs in sorted order
     
     # Calculate sample weights
     sample_weights = calculate_sample_weights(df_sales.iloc[sort_idx])
     logging.info("Sample weights calculated with log-based decay and day-of-week weighting")
     
-    # Initialize TimeSeriesSplit with fewer splits for faster training
+    # Initialize GroupTimeSeriesSplit with fewer splits for faster training
     n_splits = 5
-    tscv = TimeSeriesSplit(n_splits=n_splits)
+    gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
     
     # Common model parameters
     model_params = {
@@ -165,8 +166,8 @@ def train_model(df_sales, df_stores):
     y_log = np.log1p(y)
     median_model = RandomForestRegressor(**model_params)
     
-    # Perform time series cross-validation for median model
-    for train_idx, test_idx in tscv.split(X):
+    # Perform grouped time series cross-validation for median model
+    for train_idx, test_idx in gtscv.split(X, groups=store_ids):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y_log[train_idx], y_log[test_idx]
         weights_train = sample_weights[train_idx]
@@ -192,7 +193,7 @@ def train_model(df_sales, df_stores):
     logging.info("Training lower tail model with selected features...")
     lower_model = RandomForestRegressor(**model_params)
     
-    for train_idx, test_idx in tscv.split(X_lower):
+    for train_idx, test_idx in gtscv.split(X_lower, groups=store_ids):
         X_train, X_test = X_lower.iloc[train_idx], X_lower.iloc[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
         weights_train = sample_weights[train_idx]
@@ -209,7 +210,7 @@ def train_model(df_sales, df_stores):
     logging.info("Training upper tail model with selected features...")
     upper_model = RandomForestRegressor(**model_params)
     
-    for train_idx, test_idx in tscv.split(X_upper):
+    for train_idx, test_idx in gtscv.split(X_upper, groups=store_ids):
         X_train, X_test = X_upper.iloc[train_idx], X_upper.iloc[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
         weights_train = sample_weights[train_idx]
