@@ -175,14 +175,32 @@ elif page == "Train":
                 )
                 
                 # Display training results
-                
                 st.header("Training Results")
-                                # Display R² scores
-                col1, col2 = st.columns(2)
+                
+                # Display R² scores for each model
+                st.subheader("Model Performance")
+                col1, col2, col3 = st.columns(3)
+                
                 with col1:
-                    st.metric("Training R² Score", f"{results['train_score']:.3f}")
+                    st.metric(
+                        "Median Model",
+                        f"Train R²: {results['train_scores']['median']:.3f}",
+                        f"Test R²: {results['test_scores']['median']:.3f}"
+                    )
+                
                 with col2:
-                    st.metric("Test R² Score", f"{results['test_score']:.3f}")
+                    st.metric(
+                        "Lower Tail Model",
+                        f"Train R²: {results['train_scores']['lower']:.3f}",
+                        f"Test R²: {results['test_scores']['lower']:.3f}"
+                    )
+                
+                with col3:
+                    st.metric(
+                        "Upper Tail Model",
+                        f"Train R²: {results['train_scores']['upper']:.3f}",
+                        f"Test R²: {results['test_scores']['upper']:.3f}"
+                    )
                 
                 # Display feature importances as bar chart
                 importances_df = pd.DataFrame(
@@ -194,7 +212,7 @@ elif page == "Train":
                     importances_df,
                     x='Feature',
                     y='Importance',
-                    title='Feature Importances'
+                    title='Feature Importances (Median Model)'
                 )
                 st.plotly_chart(fig, use_container_width=True)
                 
@@ -433,3 +451,33 @@ elif page == "Predict":
                 st.error(f"Error during prediction: {str(e)}")
                 st.error("Full error details:")
                 st.exception(e)
+
+def main():
+    st.title("Fashion Revenue Predictor")
+    
+    # Sidebar
+    st.sidebar.header("Model Training")
+    if st.sidebar.button("Train New Model"):
+        with st.spinner("Training model..."):
+            # Generate synthetic data
+            df_sales, df_stores = generate_synthetic_data()
+            
+            # Train model
+            results = train_model(df_sales, df_stores)
+            
+            # Display training results
+            st.sidebar.success("Model training completed!")
+            
+            # Display scores for each model
+            st.sidebar.subheader("Model Performance")
+            for model_type in ['median', 'lower', 'upper']:
+                st.sidebar.metric(
+                    f"{model_type.title()} Model",
+                    f"Train R²: {results['train_scores'][model_type]:.3f}",
+                    f"Test R²: {results['test_scores'][model_type]:.3f}"
+                )
+            
+            # Display top features
+            st.sidebar.subheader("Top 5 Features")
+            for feat, imp in list(results['feature_importances'].items())[:5]:
+                st.sidebar.text(f"{feat}: {imp:.3f}")

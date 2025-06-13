@@ -19,63 +19,34 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
         - SHAP values
         - Top 5 most important features
     """
-    # Load model and features
-    with open('models/brandA_model.pkl', 'rb') as f:
-        model = pickle.load(f)
+    # Load models and features
+    with open('models/brandA_models.pkl', 'rb') as f:
+        models = pickle.load(f)
     with open('models/brandA_features.json', 'r') as f:
         required_features = json.load(f)
-    
-    # Load Box-Cox lambda parameter
-    with open('models/boxcox_lambda.json', 'r') as f:
-        lambda_ = json.load(f)['lambda']
     
     # Ensure all required features are present
     missing_features = set(required_features) - set(df_X.columns)
     if missing_features:
         raise ValueError(f"Missing required features: {missing_features}")
     
-    # Get predictions from each tree
-    predictions = []
-    for estimator in model.estimators_:
-        pred = estimator.predict(df_X[required_features])
-        predictions.append(pred)
+    # Get predictions from each model
+    # 1. Median predictions (log scale)
+    median_pred = np.expm1(models['median'].predict(df_X[required_features]))
     
-    # Stack predictions
-    predictions = np.stack(predictions, axis=1)
+    # 2. Lower tail predictions (untransformed)
+    lower_pred = models['lower'].predict(df_X[required_features])
     
-    # Calculate base predictions
-    base_predictions = np.median(predictions, axis=1)
-    
-    # Calculate prediction uncertainty based on:
-    # 1. Standard deviation of tree predictions
-    # 2. Store's historical volatility (revenue_std)
-    # 3. Whether it's a weekend/holiday
-    uncertainty = np.std(predictions, axis=1)
-    
-    # Add store volatility component if available
-    if 'revenue_std' in df_X.columns and 'revenue_mean' in df_X.columns:
-        # Avoid division by zero by using a small epsilon
-        epsilon = 1e-6
-        revenue_mean = np.maximum(df_X['revenue_mean'].values, epsilon)
-        uncertainty *= (1 + df_X['revenue_std'].values / revenue_mean)
-    
-    # Add weekend effect if available
-    if 'is_weekend' in df_X.columns:
-        weekend_multiplier = 1.2  # Increase uncertainty for weekends
-        uncertainty *= (1 + (df_X['is_weekend'].values * (weekend_multiplier - 1)))
+    # 3. Upper tail predictions (untransformed)
+    upper_pred = models['upper'].predict(df_X[required_features])
     
     # Calculate prediction intervals
-    p10 = base_predictions - 1.28 * uncertainty
-    p50 = base_predictions
-    p90 = base_predictions + 1.28 * uncertainty
+    p10 = lower_pred
+    p50 = median_pred
+    p90 = upper_pred
     
-    # Inverse transform predictions
-    p10 = inv_boxcox(p10, lambda_) - 1e-3
-    p50 = inv_boxcox(p50, lambda_) - 1e-3
-    p90 = inv_boxcox(p90, lambda_) - 1e-3
-    
-    # Calculate SHAP values
-    explainer = shap.TreeExplainer(model)
+    # Calculate SHAP values using median model
+    explainer = shap.TreeExplainer(models['median'])
     shap_values = explainer.shap_values(df_X[required_features])
     
     # Get feature importance scores

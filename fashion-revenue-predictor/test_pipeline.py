@@ -87,8 +87,11 @@ def test_training(df_sales, df_stores):
     try:
         results = train_model(df_sales, df_stores)
         logging.info("Training completed successfully")
-        logging.info(f"Training R² score: {results['train_score']:.3f}")
-        logging.info(f"Test R² score: {results['test_score']:.3f}")
+        
+        # Log scores for each model
+        for model_type in ['median', 'lower', 'upper']:
+            logging.info(f"{model_type} - Train R²: {results['train_scores'][model_type]:.3f}, Test R²: {results['test_scores'][model_type]:.3f}")
+        
         logging.info("Top 5 features:")
         for feat, imp in list(results['feature_importances'].items())[:5]:
             logging.info(f"{feat}: {imp:.3f}")
@@ -155,28 +158,20 @@ def test_prediction(df_sales, df_stores):
         logging.error(f"Prediction failed: {str(e)}")
         return False
 
-def main():
-    """Run the complete test pipeline."""
+if __name__ == "__main__":
     logging.info("Starting test pipeline...")
     
     # Generate synthetic data
     df_sales, df_stores = generate_synthetic_data()
     
-    # Test training
+    # Run tests
     training_success = test_training(df_sales, df_stores)
-    
-    # Test prediction
     prediction_success = test_prediction(df_sales, df_stores)
     
-    # Report results
+    # Log results
     logging.info("\nTest Results:")
     logging.info(f"Training test: {'PASSED' if training_success else 'FAILED'}")
     logging.info(f"Prediction test: {'PASSED' if prediction_success else 'FAILED'}")
     
-    if training_success and prediction_success:
-        logging.info("All tests passed successfully!")
-    else:
-        logging.error("Some tests failed. Please check the logs for details.")
-
-if __name__ == "__main__":
-    main() 
+    if not (training_success and prediction_success):
+        logging.error("Some tests failed. Please check the logs for details.") 

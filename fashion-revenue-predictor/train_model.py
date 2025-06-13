@@ -29,60 +29,82 @@ def train_model(df_sales, df_stores):
     X, features = derive_features(df_sales, df_stores, is_prediction=False)
     y = df_sales['revenue'].values
     
-    # Apply Box-Cox transformation to revenue
-    logging.info("Applying Box-Cox transformation to revenue...")
-    y_transformed, lambda_ = boxcox(y + 1e-3)  # Add small constant to handle zeros
-    
-    # Save lambda parameter for prediction
-    Path('models').mkdir(exist_ok=True)
-    with open('models/boxcox_lambda.json', 'w') as f:
-        json.dump({'lambda': float(lambda_)}, f)
-    
-    # Log feature matrix info after first derive_features call
-    print(f"X.shape: {X.shape}")
-    print(f"X.columns: {X.columns.tolist()}")
-    print("\nMissing values in X:")
-    print(X.isnull().sum().sort_values(ascending=False).head(10))
-    
-    # Keep all features including lag features
-    print(f"\nUsing all features ({len(features)}):")
-    for feat in features:
-        print(f"- {feat}")
-    
-    # Ensure X and y have same number of samples
-    if len(X) != len(y_transformed):
-        logging.error(f"Feature matrix X ({len(X)} samples) and target y ({len(y_transformed)} samples) have different lengths")
-        raise ValueError(f"Feature matrix X ({len(X)} samples) and target y ({len(y_transformed)} samples) have different lengths")
-    
-    logging.info(f"Feature matrix shape: {X.shape}")
-    logging.info(f"Target vector shape: {y_transformed.shape}")
-    
     # Split data
-    X_train, X_test, y_train, y_test = train_test_split(X, y_transformed, test_size=0.2, random_state=42)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     logging.info(f"Training set shape: {X_train.shape}")
     logging.info(f"Test set shape: {X_test.shape}")
     
-    # Initialize model
-    model = RandomForestRegressor(
+    # Train three separate models for different quantiles
+    models = {}
+    
+    # 1. Median (0.5 quantile) model - use log transformation
+    logging.info("Training median model with log transformation...")
+    y_train_log = np.log1p(y_train)
+    y_test_log = np.log1p(y_test)
+    
+    median_model = RandomForestRegressor(
         n_estimators=100,
         max_depth=10,
         min_samples_split=5,
         min_samples_leaf=2,
         random_state=42
     )
+    median_model.fit(X_train, y_train_log)
+    models['median'] = median_model
     
-    # Train model
-    logging.info("Training Random Forest model...")
-    model.fit(X_train, y_train)
+    # 2. Lower tail (0.1 quantile) model - use untransformed data
+    logging.info("Training lower tail model on untransformed data...")
+    lower_model = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=10,
+        min_samples_split=5,
+        min_samples_leaf=2,
+        random_state=42
+    )
+    lower_model.fit(X_train, y_train)
+    models['lower'] = lower_model
     
-    # Evaluate model
-    train_score = model.score(X_train, y_train)
-    test_score = model.score(X_test, y_test)
-    logging.info(f"Training R² score: {train_score:.3f}")
-    logging.info(f"Test R² score: {test_score:.3f}")
+    # 3. Upper tail (0.9 quantile) model - use untransformed data
+    logging.info("Training upper tail model on untransformed data...")
+    upper_model = RandomForestRegressor(
+        n_estimators=100,
+        max_depth=10,
+        min_samples_split=5,
+        min_samples_leaf=2,
+        random_state=42
+    )
+    upper_model.fit(X_train, y_train)
+    models['upper'] = upper_model
     
-    # Get feature importances
-    importances = dict(zip(X_train.columns, model.feature_importances_))
+    # Evaluate models
+    train_scores = {}
+    test_scores = {}
+    
+    # Median model evaluation
+    train_pred_median = np.expm1(median_model.predict(X_train))
+    test_pred_median = np.expm1(median_model.predict(X_test))
+    train_scores['median'] = np.corrcoef(y_train, train_pred_median)[0,1]**2
+    test_scores['median'] = np.corrcoef(y_test, test_pred_median)[0,1]**2
+    
+    # Lower tail model evaluation
+    train_pred_lower = lower_model.predict(X_train)
+    test_pred_lower = lower_model.predict(X_test)
+    train_scores['lower'] = np.corrcoef(y_train, train_pred_lower)[0,1]**2
+    test_scores['lower'] = np.corrcoef(y_test, test_pred_lower)[0,1]**2
+    
+    # Upper tail model evaluation
+    train_pred_upper = upper_model.predict(X_train)
+    test_pred_upper = upper_model.predict(X_test)
+    train_scores['upper'] = np.corrcoef(y_train, train_pred_upper)[0,1]**2
+    test_scores['upper'] = np.corrcoef(y_test, test_pred_upper)[0,1]**2
+    
+    # Log scores
+    logging.info("Model evaluation scores:")
+    for model_type in ['median', 'lower', 'upper']:
+        logging.info(f"{model_type} - Train R²: {train_scores[model_type]:.3f}, Test R²: {test_scores[model_type]:.3f}")
+    
+    # Get feature importances from median model
+    importances = dict(zip(X_train.columns, median_model.feature_importances_))
     sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
     
     # Print top 5 features
@@ -90,25 +112,25 @@ def train_model(df_sales, df_stores):
     for feat, imp in list(sorted_importances.items())[:5]:
         print(f"{feat}: {imp:.3f}")
     
-    # Save model and features
+    # Save models and features
     Path('models').mkdir(exist_ok=True)
-    model_path = 'models/brandA_model.pkl'
+    model_path = 'models/brandA_models.pkl'
     features_path = 'models/brandA_features.json'
     
     with open(model_path, 'wb') as f:
-        pickle.dump(model, f)
+        pickle.dump(models, f)
     with open(features_path, 'w') as f:
         json.dump(features, f)
     
-    print(f"\nModel saved to: {model_path}")
+    print(f"\nModels saved to: {model_path}")
     print(f"Features saved to: {features_path}")
     print(f"Final feature count: {len(features)}")
     
-    logging.info("Model and features saved successfully")
+    logging.info("Models and features saved successfully")
     
     # Return training metrics
     return {
-        'train_score': train_score,
-        'test_score': test_score,
+        'train_scores': train_scores,
+        'test_scores': test_scores,
         'feature_importances': sorted_importances
     }
