@@ -145,89 +145,85 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, is_predicti
         }).fillna(0)
         store_stats.columns = ['_'.join(col).strip() for col in store_stats.columns.values]
         
+        # Calculate store-month seasonal indices
+        store_month_stats = df.groupby(['store', 'month']).agg({
+            'revenue': ['mean', 'std']
+        }).fillna(0)
+        store_month_stats.columns = ['store_month_revenue_mean', 'store_month_revenue_std']
+        
         # Save store stats for prediction
         store_stats.to_json('models/store_stats.json')
+        store_month_stats.to_json('models/store_month_stats.json')
         
         # Add store stats to features
         store_stats_features = store_stats.columns.tolist()
+        store_month_features = store_month_stats.columns.tolist()
         features.extend(store_stats_features)
+        features.extend(store_month_features)
         
         # Merge store stats
         df = df.merge(store_stats, on='store', how='left')
+        df = df.merge(store_month_stats, on=['store', 'month'], how='left')
     else:
         # During prediction, load store stats
         try:
             store_stats = pd.read_json('models/store_stats.json')
+            store_month_stats = pd.read_json('models/store_month_stats.json')
+            
             # Ensure store IDs are strings
             store_stats.index = store_stats.index.astype(str)
+            store_month_stats.index = store_month_stats.index.get_level_values(0).astype(str)
+            
             # Reset index to make store ID a column
             store_stats = store_stats.reset_index()
             store_stats = store_stats.rename(columns={'index': 'store'})
             
+            store_month_stats = store_month_stats.reset_index()
+            store_month_stats = store_month_stats.rename(columns={'level_0': 'store', 'level_1': 'month'})
+            
             # Add store stats to features
             store_stats_features = store_stats.columns.drop('store').tolist()
+            store_month_features = store_month_stats.columns.drop(['store', 'month']).tolist()
             features.extend(store_stats_features)
+            features.extend(store_month_features)
             
             # Merge store stats
             df = df.merge(store_stats, on='store', how='left')
+            df = df.merge(store_month_stats, on=['store', 'month'], how='left')
         except:
             # If no stats available, create empty stats
             store_stats_features = [
                 'revenue_mean', 'revenue_std', 'revenue_median',
                 'qty_sold_mean', 'qty_sold_std', 'qty_sold_median'
             ]
+            store_month_features = [
+                'store_month_revenue_mean', 'store_month_revenue_std'
+            ]
             features.extend(store_stats_features)
+            features.extend(store_month_features)
             
             # Add empty stats
             for feat in store_stats_features:
                 df[feat] = 0
+            for feat in store_month_features:
+                df[feat] = 0
     
-    # 5. Lagged Features
-    logging.info("Generating lagged features...")
+    # 5. Lightweight Lag Proxies
+    logging.info("Generating lightweight lag proxies...")
     if not is_prediction:
-        # During training, calculate all lags
-        for lag in [1, 7, 14, 30]:
-            df[f'revenue_lag_{lag}'] = df.groupby('store')['revenue'].shift(lag)
-            df[f'qty_sold_lag_{lag}'] = df.groupby('store')['qty_sold'].shift(lag)
-            features.extend([f'revenue_lag_{lag}', f'qty_sold_lag_{lag}'])
-    else:
-        # During prediction, use last known values or zeros
-        for lag in [1, 7, 14, 30]:
-            df[f'revenue_lag_{lag}'] = 0
-            df[f'qty_sold_lag_{lag}'] = 0
-            features.extend([f'revenue_lag_{lag}', f'qty_sold_lag_{lag}'])
-    
-    # 6. Rolling Features
-    logging.info("Generating rolling features...")
-    if not is_prediction:
-        # During training, calculate all rolling features
-        for window in [7, 14, 30]:
-            df[f'revenue_rolling_mean_{window}'] = df.groupby('store')['revenue'].transform(
-                lambda x: x.rolling(window, min_periods=1).mean()
-            )
-            df[f'qty_sold_rolling_mean_{window}'] = df.groupby('store')['qty_sold'].transform(
-                lambda x: x.rolling(window, min_periods=1).mean()
-            )
-            features.extend([f'revenue_rolling_mean_{window}', f'qty_sold_rolling_mean_{window}'])
+        # During training, calculate 7-day averages
+        df['revenue_7d_avg'] = df.groupby('store')['revenue'].transform(
+            lambda x: x.rolling(7, min_periods=1).mean()
+        )
+        df['qty_sold_7d_avg'] = df.groupby('store')['qty_sold'].transform(
+            lambda x: x.rolling(7, min_periods=1).mean()
+        )
+        features.extend(['revenue_7d_avg', 'qty_sold_7d_avg'])
     else:
         # During prediction, use store-level means
-        for window in [7, 14, 30]:
-            df[f'revenue_rolling_mean_{window}'] = df['revenue_mean']
-            df[f'qty_sold_rolling_mean_{window}'] = df['qty_sold_mean']
-            features.extend([f'revenue_rolling_mean_{window}', f'qty_sold_rolling_mean_{window}'])
-    
-    # 7. Growth & Seasonality
-    logging.info("Generating growth and seasonality features...")
-    if not is_prediction:
-        # During training, calculate growth rates
-        df['revenue_growth'] = df.groupby('store')['revenue'].pct_change().fillna(0)
-        df['qty_sold_growth'] = df.groupby('store')['qty_sold'].pct_change().fillna(0)
-    else:
-        # During prediction, use zeros
-        df['revenue_growth'] = 0
-        df['qty_sold_growth'] = 0
-    
-    features.extend(['revenue_growth', 'qty_sold_growth'])
+        df['revenue_7d_avg'] = df['revenue_mean']
+        df['qty_sold_7d_avg'] = df['qty_sold_mean']
+        features.extend(['revenue_7d_avg', 'qty_sold_7d_avg'])
     
     # Select features and handle missing values
     logging.info("Selecting final features...")

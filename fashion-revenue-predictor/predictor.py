@@ -46,8 +46,15 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     # 2. Store's historical volatility (revenue_std)
     # 3. Whether it's a weekend/holiday
     uncertainty = np.std(predictions, axis=1)
-    if 'revenue_std' in df_X.columns:
-        uncertainty *= (1 + df_X['revenue_std'].values / df_X['revenue_mean'].values)
+    
+    # Add store volatility component if available
+    if 'revenue_std' in df_X.columns and 'revenue_mean' in df_X.columns:
+        # Avoid division by zero by using a small epsilon
+        epsilon = 1e-6
+        revenue_mean = np.maximum(df_X['revenue_mean'].values, epsilon)
+        uncertainty *= (1 + df_X['revenue_std'].values / revenue_mean)
+    
+    # Add weekend effect if available
     if 'is_weekend' in df_X.columns:
         uncertainty *= (1 + 0.2 * df_X['is_weekend'].values)  # 20% more uncertainty on weekends
     
@@ -65,6 +72,12 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     # Calculate SHAP values
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(df_X[required_features])
+    
+    # Log top SHAP features
+    print("\nTop SHAP features for prediction:")
+    top_shap = sorted(zip(df_X.columns, shap_values[0]), key=lambda x: abs(x[1]), reverse=True)[:10]
+    for feature, value in top_shap:
+        print(f"{feature}: {value:.3f}")
     
     # Get top 5 features by absolute SHAP value
     mean_shap = np.abs(shap_values).mean(axis=0)

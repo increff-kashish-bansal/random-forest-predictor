@@ -28,6 +28,25 @@ def train_model(df_sales, df_stores):
     X, features = derive_features(df_sales, df_stores, is_prediction=False)
     y = df_sales['revenue'].values
     
+    # Log feature matrix info after first derive_features call
+    print(f"X.shape: {X.shape}")
+    print(f"X.columns: {X.columns.tolist()}")
+    print("\nMissing values in X:")
+    print(X.isnull().sum().sort_values(ascending=False).head(10))
+    
+    # Remove lag-dependent features
+    lag_features = [col for col in X.columns if any(term in col for term in ['lag', 'rolling', 'growth'])]
+    print(f"\nRemoving {len(lag_features)} lag-dependent features:")
+    for feat in lag_features:
+        print(f"- {feat}")
+    
+    X = X.drop(columns=lag_features)
+    features = [f for f in features if f not in lag_features]
+    
+    print(f"\nRemaining features ({len(features)}):")
+    for feat in features:
+        print(f"- {feat}")
+    
     # Ensure X and y have same number of samples
     if len(X) != len(y):
         logging.error(f"Feature matrix X ({len(X)} samples) and target y ({len(y)} samples) have different lengths")
@@ -61,15 +80,27 @@ def train_model(df_sales, df_stores):
     logging.info(f"Test R² score: {test_score:.3f}")
     
     # Get feature importances
-    importances = dict(zip(features, model.feature_importances_))
+    importances = dict(zip(X_train.columns, model.feature_importances_))
     sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
+    
+    # Print top 5 features
+    print("\nTop 5 Most Important Features:")
+    for feat, imp in list(sorted_importances.items())[:5]:
+        print(f"{feat}: {imp:.3f}")
     
     # Save model and features
     Path('models').mkdir(exist_ok=True)
-    with open('models/brandA_model.pkl', 'wb') as f:
+    model_path = 'models/brandA_model.pkl'
+    features_path = 'models/brandA_features.json'
+    
+    with open(model_path, 'wb') as f:
         pickle.dump(model, f)
-    with open('models/brandA_features.json', 'w') as f:
+    with open(features_path, 'w') as f:
         json.dump(features, f)
+    
+    print(f"\nModel saved to: {model_path}")
+    print(f"Features saved to: {features_path}")
+    print(f"Final feature count: {len(features)}")
     
     logging.info("Model and features saved successfully")
     

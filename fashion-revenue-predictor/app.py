@@ -8,6 +8,7 @@ from utils.feature_engineering import derive_features
 from train_model import train_model
 from predictor import predict_and_explain
 import logging
+from datetime import datetime
 
 # Page config
 st.set_page_config(
@@ -187,195 +188,211 @@ elif page == "Train":
                     st.write(f"{feat}: {imp:.3f}")
 
 elif page == "Predict":
-    st.title("Revenue Prediction")
+    st.title("Predict Revenue")
     
     if 'processed_sales' not in st.session_state or 'processed_stores' not in st.session_state:
-        st.warning("Please upload and process data in the Upload page first.")
+        st.warning("Please upload and process data first.")
     else:
-        df_sales = st.session_state['processed_sales']
-        df_stores = st.session_state['processed_stores']
+        # Get inputs
+        store_id = st.selectbox("Select Store", options=st.session_state.processed_stores['id'].unique())
+        future_date = st.date_input("Select Future Date", min_value=datetime.now().date())
+        store_area = st.number_input("Store Area (sq ft)", min_value=0.0, value=float(st.session_state.processed_stores[st.session_state.processed_stores['id'] == store_id]['store_area'].iloc[0]))
+        discount_pct = st.slider("Discount Percentage", min_value=0.0, max_value=1.0, value=0.0, step=0.01)
         
-        # Input section
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Store selection
-            store_ids = df_stores['id'].unique().tolist()
-            
-            # Get list of stores with sales data
-            stores_with_sales = df_sales['store'].unique().tolist()
-            valid_stores = [s for s in store_ids if s in stores_with_sales]
-            
-            if not valid_stores:
-                st.error("No stores found with sales data. Please upload sales data first.")
-                st.stop()
-            
-            # Show store selection with validation
-            store_id = st.selectbox(
-                "Select Store",
-                valid_stores,
-                format_func=lambda x: f"Store {x} ({len(df_sales[df_sales['store'] == x])} sales records)"
-            )
-            
-            # Date selection
-            future_date = st.date_input("Select Future Date")
-        
-        with col2:
-            # Get store metadata for pre-filling
-            store_meta = df_stores[df_stores['id'] == store_id].iloc[0]
-            
-            # Store area input
-            store_area = st.number_input(
-                "Store Area (sq ft)",
-                min_value=0,
-                value=int(store_meta['store_area'])
-            )
-            
-            # Discount input with validation
-            disc_value = st.slider(
-                "Discount Value (%)",
-                min_value=0,
-                max_value=100,
-                value=0,
-                help="Enter a discount percentage between 0 and 100"
-            )
-            
-            # Convert percentage to decimal for calculation
-            disc_decimal = disc_value / 100.0
-            
-            # Add a warning for high discounts
-            if disc_value > 50:
-                st.warning("High discount values may affect prediction accuracy")
-        
-        # Predict button
-        if st.button("Predict Revenue"):
-            with st.spinner("Generating prediction..."):
-                try:
-                    # Get store metadata and ensure store_id is string
-                    store_id = str(store_id)
-                    st.info(f"Selected store ID: {store_id}")
+        if st.button("Predict"):
+            try:
+                # Create synthetic sales row
+                synthetic_sales = pd.DataFrame({
+                    'store': [store_id],
+                    'date': [pd.Timestamp(future_date)],
+                    'qty_sold': [0],
+                    'revenue': [0],
+                    'disc_perc': [discount_pct]
+                })
+                
+                # Get matching store row
+                store_row = st.session_state.processed_stores[st.session_state.processed_stores['id'] == store_id].copy()
+                store_row['store_area'] = store_area  # Update with user input
+                
+                # Generate features
+                X_pred, features = derive_features(synthetic_sales, store_row, is_prediction=True)
+                
+                # Fill any remaining NaN values with 0
+                X_pred = X_pred.fillna(0)
+                
+                # Load required features
+                with open('models/brandA_features.json', 'r') as f:
+                    required_features = json.load(f)
+                
+                # Check for missing features
+                missing_features = set(required_features) - set(X_pred.columns)
+                if missing_features:
+                    st.error(f"Missing features: {missing_features}")
+                    st.stop()
+                
+                # Select features in correct order
+                X_pred = X_pred[required_features]
+                
+                # Make prediction
+                results = predict_and_explain(X_pred)
+                
+                # Display results
+                st.markdown("---")
+                st.markdown("### 📊 Prediction Results")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric(
+                        "Predicted Revenue",
+                        f"₹{float(results['p50'][0]):,.2f}",
+                        delta=None
+                    )
+                with col2:
+                    st.metric(
+                        "Prediction Range",
+                        f"₹{float(results['p10'][0]):,.2f} - ₹{float(results['p90'][0]):,.2f}",
+                        delta=None
+                    )
+                
+                # Historical Comparison Section
+                st.markdown("### Historical Comparison")
+                
+                # 1. Predicted Sales for Future Date
+                st.markdown(f"#### Predicted Sales for {future_date.strftime('%d %B %Y')}")
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("P50 Revenue", f"₹{float(results['p50'][0]):,.2f}")
+                with col2:
+                    st.metric("Prediction Range", f"₹{float(results['p10'][0]):,.2f} - ₹{float(results['p90'][0]):,.2f}")
+                
+                st.markdown("---")
+                
+                # 2. Monthly Averages by Year
+                st.markdown("#### Monthly Averages by Year")
+                historical_data = st.session_state.processed_sales[
+                    st.session_state.processed_sales['store'] == store_id
+                ].copy()
+                
+                # Convert future_date to datetime64[ns]
+                future_date = pd.to_datetime(future_date)
+                
+                # Add year and month columns for comparison
+                historical_data['year'] = historical_data['date'].dt.year
+                historical_data['month'] = historical_data['date'].dt.month
+                historical_data['day'] = historical_data['date'].dt.day
+                
+                # Filter out future data
+                historical_data = historical_data[historical_data['date'] < future_date]
+                
+                same_month_data = historical_data[
+                    (historical_data['month'] == future_date.month)
+                ].sort_values('year', ascending=False)
+                
+                if not same_month_data.empty:
+                    # Calculate monthly totals and averages
+                    same_month_metrics = same_month_data.groupby('year').agg({
+                        'revenue': ['sum', 'mean'],
+                        'qty_sold': ['sum', 'mean'],
+                        'disc_perc': 'mean'
+                    }).round(2)
                     
-                    # Get store metadata
-                    store_meta = df_stores[df_stores['id'] == store_id]
-                    if len(store_meta) == 0:
-                        raise ValueError(f"Store {store_id} not found in store data")
-                    store_meta = store_meta.iloc[0]
+                    # Display metrics in columns
+                    cols = st.columns(len(same_month_metrics))
+                    for idx, (year, metrics) in enumerate(same_month_metrics.iterrows()):
+                        with cols[idx]:
+                            st.markdown(f"**{future_date.strftime('%B')} {year}**")
+                            st.metric(
+                                "Total Revenue",
+                                f"₹{metrics[('revenue', 'sum')]:,.2f}"
+                            )
+                            st.metric(
+                                "Avg Daily Revenue",
+                                f"₹{metrics[('revenue', 'mean')]:,.2f}"
+                            )
+                            st.metric(
+                                "Total Qty Sold",
+                                f"{metrics[('qty_sold', 'sum')]:,.0f}"
+                            )
+                            st.metric(
+                                "Avg Daily Qty",
+                                f"{metrics[('qty_sold', 'mean')]:,.0f}"
+                            )
+                            st.metric(
+                                "Avg Discount",
+                                f"{metrics[('disc_perc', 'mean')]*100:.1f}%"
+                            )
+                
+                st.markdown("---")
+                
+                # 3. Same Day Actuals by Year
+                st.markdown(f"#### Actual Sales for {future_date.strftime('%d %B')} by Year")
+                same_day_data = historical_data[
+                    (historical_data['month'] == future_date.month) & 
+                    (historical_data['day'] == future_date.day)
+                ].sort_values('year', ascending=False)
+                
+                if not same_day_data.empty:
+                    # Group by year and get the exact day's data
+                    same_day_metrics = same_day_data.groupby('year').agg({
+                        'revenue': 'first',
+                        'qty_sold': 'first',
+                        'disc_perc': 'first'
+                    }).round(2)
                     
-                    # Validate store exists in sales data
-                    logging.info(f"Available store IDs in sales data: {df_sales['store'].unique()}")
-                    logging.info(f"Store ID type in sales data: {df_sales['store'].dtype}")
-                    
-                    # Ensure store IDs are strings in both dataframes
-                    df_sales['store'] = df_sales['store'].astype(str)
-                    df_stores['id'] = df_stores['id'].astype(str)
-                    
-                    # Check if store has sales data
-                    store_sales = df_sales[df_sales['store'] == store_id]
-                    if len(store_sales) == 0:
-                        st.error(f"No sales data found for store {store_id}. Please ensure the store has historical sales data.")
-                        st.stop()
-                    
-                    # Create synthetic sales row with user inputs
-                    synthetic_sales = pd.DataFrame({
-                        'store': [store_id],
-                        'date': [pd.to_datetime(future_date)],
-                        'qty_sold': [0],
-                        'revenue': [1000],  # Set a base revenue to calculate discount
-                        'disc_perc': [disc_decimal]  # Use the discount percentage directly
-                    })
-                    
-                    # Create synthetic stores row with store metadata
-                    synthetic_stores = pd.DataFrame({
-                        'id': [store_id],
-                        'channel': [store_meta['channel']],
-                        'city': [store_meta['city']],
-                        'region': [store_meta['region']],
-                        'store_area': [store_area],
-                        'is_online': [store_meta['is_online']]
-                    })
-                    
-                    # Generate features
-                    X, _ = derive_features(synthetic_sales, synthetic_stores, is_prediction=True)
-                    
-                    # Make prediction
-                    prediction = predict_and_explain(X)
-                    
-                    # Display results
-                    st.header("Prediction Results")
-                    
-                    # Display prediction intervals
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("P10 Revenue", f"₹{prediction['p10'][0]:,.0f}")
-                    with col2:
-                        st.metric("P50 Revenue", f"₹{prediction['p50'][0]:,.0f}")
-                    with col3:
-                        st.metric("P90 Revenue", f"₹{prediction['p90'][0]:,.0f}")
-                    
-                    # Show historical revenue for same store
-                    st.subheader("Historical Revenue")
-                    
-                    # Convert dates to datetime
-                    df_sales['date'] = pd.to_datetime(df_sales['date'])
-                    future_date = pd.to_datetime(future_date)
-                    
-                    logging.info(f"Looking up historical data for store {store_id}")
-                    logging.info(f"Future date: {future_date}")
-                    logging.info(f"Total sales records: {len(df_sales)}")
-                    
-                    # Get historical data for same store
-                    store_history = df_sales[df_sales['store'] == store_id].copy()
-                    logging.info(f"Store history records: {len(store_history)}")
-                    logging.info(f"Store history date range: {store_history['date'].min()} to {store_history['date'].max()}")
-                    
-                    # Add day and month columns
-                    store_history['day'] = store_history['date'].dt.day
-                    store_history['month'] = store_history['date'].dt.month
-                    
-                    logging.info(f"Looking for day {future_date.day} and month {future_date.month}")
-                    
-                    # Get same day/month from previous years
-                    same_day_month = store_history[
-                        (store_history['day'] == future_date.day) & 
-                        (store_history['month'] == future_date.month) &
-                        (store_history['date'] < future_date)  # Only look at past dates
-                    ].sort_values('date', ascending=False)  # Most recent first
-                    
-                    logging.info(f"Found {len(same_day_month)} records for same day/month")
-                    if not same_day_month.empty:
-                        logging.info("Same day/month records:")
-                        for _, row in same_day_month.iterrows():
-                            logging.info(f"Date: {row['date']}, Revenue: {row['revenue']}")
-                    
-                    if not same_day_month.empty:
-                        # Display historical revenue for same day/month
-                        st.write("Revenue on same day/month in previous years:")
-                        for _, row in same_day_month.iterrows():
-                            st.write(f"{row['date'].strftime('%Y-%m-%d')}: ₹{row['revenue']:,.0f}")
-                        
-                        # Calculate average historical revenue
-                        avg_historical = same_day_month['revenue'].mean()
-                        st.metric("Average Historical Revenue", f"₹{avg_historical:,.0f}")
-                        logging.info(f"Average historical revenue: {avg_historical:,.0f}")
-                        
-                        # Show year-over-year comparison
-                        if len(same_day_month) > 1:
-                            latest = same_day_month.iloc[0]['revenue']
-                            previous = same_day_month.iloc[1]['revenue']
-                            yoy_change = ((latest - previous) / previous) * 100
-                            st.metric("Year-over-Year Change", f"{yoy_change:+.1f}%")
-                            logging.info(f"YoY change: {yoy_change:+.1f}% (Latest: {latest:,.0f}, Previous: {previous:,.0f})")
-                    else:
-                        st.write("No historical data available for this day/month")
-                        logging.info("No historical data found for same day/month")
-                        
-                        # Show closest available dates
-                        st.write("Closest available dates:")
-                        closest_dates = store_history.nsmallest(3, 'date')
-                        logging.info("Closest available dates:")
-                        for _, row in closest_dates.iterrows():
-                            st.write(f"{row['date'].strftime('%Y-%m-%d')}: ₹{row['revenue']:,.0f}")
-                            logging.info(f"Date: {row['date']}, Revenue: {row['revenue']:,.0f}")
-
-                except Exception as e:
-                    st.error(f"Error generating prediction: {str(e)}")
+                    # Display metrics in columns
+                    cols = st.columns(len(same_day_metrics))
+                    for idx, (year, metrics) in enumerate(same_day_metrics.iterrows()):
+                        with cols[idx]:
+                            st.markdown(f"**{year}**")
+                            st.metric(
+                                "Revenue",
+                                f"₹{metrics['revenue']:,.2f}"
+                            )
+                            st.metric(
+                                "Qty Sold",
+                                f"{metrics['qty_sold']:,.0f}"
+                            )
+                            st.metric(
+                                "Discount",
+                                f"{metrics['disc_perc']*100:.1f}%"
+                            )
+                
+                st.markdown("---")
+                
+                # 4. Yearly Averages
+                st.markdown("#### Yearly Averages")
+                yearly_avg = historical_data.groupby('year').agg({
+                    'revenue': ['sum', 'mean'],
+                    'qty_sold': ['sum', 'mean'],
+                    'disc_perc': 'mean'
+                }).round(2)
+                
+                if not yearly_avg.empty:
+                    # Display metrics in columns
+                    cols = st.columns(len(yearly_avg))
+                    for idx, (year, metrics) in enumerate(yearly_avg.iterrows()):
+                        with cols[idx]:
+                            st.markdown(f"**{year}**")
+                            st.metric(
+                                "Total Revenue",
+                                f"₹{metrics[('revenue', 'sum')]:,.2f}"
+                            )
+                            st.metric(
+                                "Avg Daily Revenue",
+                                f"₹{metrics[('revenue', 'mean')]:,.2f}"
+                            )
+                            st.metric(
+                                "Total Qty Sold",
+                                f"{metrics[('qty_sold', 'sum')]:,.0f}"
+                            )
+                            st.metric(
+                                "Avg Daily Qty",
+                                f"{metrics[('qty_sold', 'mean')]:,.0f}"
+                            )
+                            st.metric(
+                                "Avg Discount",
+                                f"{metrics[('disc_perc', 'mean')]*100:.1f}%"
+                            )
+            except Exception as e:
+                st.error(f"Error during prediction: {str(e)}")
+                st.error("Full error details:")
+                st.exception(e)
