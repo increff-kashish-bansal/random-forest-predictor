@@ -44,16 +44,8 @@ def train_model(df_sales, df_stores):
     print("\nMissing values in X:")
     print(X.isnull().sum().sort_values(ascending=False).head(10))
     
-    # Remove lag-dependent features
-    lag_features = [col for col in X.columns if any(term in col for term in ['lag', 'rolling', 'growth'])]
-    print(f"\nRemoving {len(lag_features)} lag-dependent features:")
-    for feat in lag_features:
-        print(f"- {feat}")
-    
-    X = X.drop(columns=lag_features)
-    features = [f for f in features if f not in lag_features]
-    
-    print(f"\nRemaining features ({len(features)}):")
+    # Keep all features including lag features
+    print(f"\nUsing all features ({len(features)}):")
     for feat in features:
         print(f"- {feat}")
     

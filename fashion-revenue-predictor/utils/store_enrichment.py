@@ -10,6 +10,7 @@ from pathlib import Path
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import KBinsDiscretizer
 
 # Configure logging
 logging.basicConfig(
@@ -68,104 +69,128 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
     
     df['region_classified'] = df['state'].map(state_to_region)
     
-    # 3. Add store tier based on store area
+    # 3. Add store tier based on store area with more granular bucketing
     if not is_prediction:
-        # During training, create bins using simple categorization
-        min_area = df['store_area'].min()
-        max_area = df['store_area'].max()
-        bin_size = (max_area - min_area) / 3
-        
-        def get_tier(area):
-            if area <= min_area + bin_size:
-                return 'TIER_3'
-            elif area <= min_area + 2 * bin_size:
-                return 'TIER_2'
-            else:
-                return 'TIER_1'
-        
-        df['store_tier'] = df['store_area'].apply(get_tier)
+        # During training, create more granular bins using KBinsDiscretizer
+        kbd = KBinsDiscretizer(n_bins=5, encode='ordinal', strategy='quantile')
+        df['store_area_bucket'] = kbd.fit_transform(df[['store_area']]).astype(int)
         
         # Save bin edges for prediction
-        bin_edges = [float(min_area), float(min_area + bin_size), float(min_area + 2 * bin_size), float(max_area)]
+        bin_edges = kbd.bin_edges_[0].tolist()
         Path('models').mkdir(exist_ok=True)
-        with open('models/store_tier_bins.json', 'w') as f:
+        with open('models/store_area_bins.json', 'w') as f:
             json.dump(bin_edges, f)
     else:
-        # During prediction, use simple categorization
+        # During prediction, use saved bin edges
         try:
-            with open('models/store_tier_bins.json', 'r') as f:
+            with open('models/store_area_bins.json', 'r') as f:
                 bin_edges = json.load(f)
             
-            def get_tier(area):
-                if area <= bin_edges[1]:
-                    return 'TIER_3'
-                elif area <= bin_edges[2]:
-                    return 'TIER_2'
-                else:
-                    return 'TIER_1'
-            
-            df['store_tier'] = df['store_area'].apply(get_tier)
+            df['store_area_bucket'] = pd.cut(
+                df['store_area'],
+                bins=bin_edges,
+                labels=False,
+                include_lowest=True
+            ).fillna(0).astype(int)
         except Exception:
-            # If binning fails, assign all to TIER_2
-            df['store_tier'] = 'TIER_2'
+            df['store_area_bucket'] = 2  # Default to middle bucket if binning fails
     
     # 4. Create store clusters using multiple features
     if not is_prediction:
         # During training, perform clustering
         
-        # Calculate store-month seasonal features
+        # Calculate store-month seasonal features with more granular patterns
         store_month_stats = df.groupby(['store', 'month']).agg({
-            'revenue': ['mean', 'std']
+            'revenue': ['mean', 'std', 'min', 'max'],
+            'quantity': ['mean', 'std'],
+            'discount': ['mean', 'std']
         }).fillna(0)
-        store_month_stats.columns = ['store_month_revenue_mean', 'store_month_revenue_std']
-        
-        # Calculate store-level seasonal features
-        store_seasonal_features = store_month_stats.groupby('store').agg({
-            'store_month_revenue_mean': ['mean', 'std'],
-            'store_month_revenue_std': ['mean', 'std']
-        }).fillna(0)
-        store_seasonal_features.columns = [
-            'store_month_revenue_mean_avg',
-            'store_month_revenue_mean_std',
-            'store_month_revenue_std_avg',
-            'store_month_revenue_std_std'
+        store_month_stats.columns = [
+            'store_month_revenue_mean', 'store_month_revenue_std',
+            'store_month_revenue_min', 'store_month_revenue_max',
+            'store_month_quantity_mean', 'store_month_quantity_std',
+            'store_month_discount_mean', 'store_month_discount_std'
         ]
         
-        # Calculate holiday revenue ratio (assuming holidays are in December)
-        holiday_revenue = df[df['month'] == 12].groupby('store')['revenue'].mean()
-        non_holiday_revenue = df[df['month'] != 12].groupby('store')['revenue'].mean()
-        holiday_ratio = (holiday_revenue / non_holiday_revenue).fillna(1)
+        # Calculate store-level seasonal features with enhanced metrics
+        store_seasonal_features = store_month_stats.groupby('store').agg({
+            'store_month_revenue_mean': ['mean', 'std', 'max'],
+            'store_month_revenue_std': ['mean', 'std'],
+            'store_month_quantity_mean': ['mean', 'std'],
+            'store_month_discount_mean': ['mean', 'std']
+        }).fillna(0)
+        store_seasonal_features.columns = [
+            'store_month_revenue_mean_avg', 'store_month_revenue_mean_std',
+            'store_month_revenue_mean_max',
+            'store_month_revenue_std_avg', 'store_month_revenue_std_std',
+            'store_month_quantity_mean_avg', 'store_month_quantity_mean_std',
+            'store_month_discount_mean_avg', 'store_month_discount_mean_std'
+        ]
+        
+        # Calculate holiday and seasonal patterns
+        holiday_months = [12, 1, 2]  # December, January, February
+        summer_months = [4, 5, 6]    # April, May, June
+        
+        holiday_revenue = df[df['month'].isin(holiday_months)].groupby('store')['revenue'].mean()
+        summer_revenue = df[df['month'].isin(summer_months)].groupby('store')['revenue'].mean()
+        regular_revenue = df[~df['month'].isin(holiday_months + summer_months)].groupby('store')['revenue'].mean()
+        
+        holiday_ratio = (holiday_revenue / regular_revenue).fillna(1)
+        summer_ratio = (summer_revenue / regular_revenue).fillna(1)
+        
         holiday_ratio.name = 'holiday_revenue_ratio'
+        summer_ratio.name = 'summer_revenue_ratio'
         
-        # Create region/city one-hot averages
-        region_avg = df.groupby('region_classified')['revenue'].mean()
-        city_avg = df.groupby('city')['revenue'].mean()
+        # Create enhanced location features
+        region_avg = df.groupby('region_classified').agg({
+            'revenue': ['mean', 'std'],
+            'quantity': 'mean',
+            'discount': 'mean'
+        }).fillna(0)
+        region_avg.columns = ['region_revenue_avg', 'region_revenue_std', 
+                            'region_quantity_avg', 'region_discount_avg']
         
-        # Normalize region and city averages
-        region_avg = (region_avg - region_avg.mean()) / region_avg.std()
-        city_avg = (city_avg - city_avg.mean()) / city_avg.std()
+        city_avg = df.groupby('city').agg({
+            'revenue': ['mean', 'std'],
+            'quantity': 'mean',
+            'discount': 'mean'
+        }).fillna(0)
+        city_avg.columns = ['city_revenue_avg', 'city_revenue_std',
+                          'city_quantity_avg', 'city_discount_avg']
+        
+        # Normalize location features
+        for col in region_avg.columns:
+            region_avg[col] = (region_avg[col] - region_avg[col].mean()) / region_avg[col].std()
+            city_avg[col] = (city_avg[col] - city_avg[col].mean()) / city_avg[col].std()
         
         # Map averages back to stores
-        df['region_revenue_avg'] = df['region_classified'].map(region_avg)
-        df['city_revenue_avg'] = df['city'].map(city_avg)
+        for col in region_avg.columns:
+            df[f'region_{col}'] = df['region_classified'].map(region_avg[col])
+            df[f'city_{col}'] = df['city'].map(city_avg[col])
         
         # Combine all features for clustering
         cluster_features = [
             'store_area',
+            'store_area_bucket',
             'is_online',
-            'region_revenue_avg',
-            'city_revenue_avg'
+            'region_revenue_avg', 'region_revenue_std',
+            'region_quantity_avg', 'region_discount_avg',
+            'city_revenue_avg', 'city_revenue_std',
+            'city_quantity_avg', 'city_discount_avg'
         ]
         
         # Add seasonal features
         df = df.merge(store_seasonal_features, on='store', how='left')
         df = df.merge(holiday_ratio, on='store', how='left')
+        df = df.merge(summer_ratio, on='store', how='left')
+        
         cluster_features.extend([
-            'store_month_revenue_mean_avg',
-            'store_month_revenue_mean_std',
-            'store_month_revenue_std_avg',
-            'store_month_revenue_std_std',
-            'holiday_revenue_ratio'
+            'store_month_revenue_mean_avg', 'store_month_revenue_mean_std',
+            'store_month_revenue_mean_max',
+            'store_month_revenue_std_avg', 'store_month_revenue_std_std',
+            'store_month_quantity_mean_avg', 'store_month_quantity_mean_std',
+            'store_month_discount_mean_avg', 'store_month_discount_mean_std',
+            'holiday_revenue_ratio', 'summer_revenue_ratio'
         ])
         
         # Scale features
@@ -212,10 +237,8 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
             
             # Find nearest cluster center
             centers = np.array(cluster_info['cluster_centers'])
-            # Reshape X_cluster to 2D if it's 1D
             if len(X_cluster_pca.shape) == 1:
                 X_cluster_pca = X_cluster_pca.reshape(1, -1)
-            # Calculate distances to each center
             distances = np.array([np.linalg.norm(X_cluster_pca - center, axis=1) for center in centers])
             df['store_cluster'] = np.argmin(distances, axis=0)
         except FileNotFoundError:
@@ -227,13 +250,16 @@ def enrich_store_data(df_stores: pd.DataFrame, is_prediction: bool = False) -> p
                 include_lowest=True
             )
     
-    # Map cluster numbers to meaningful labels
+    # Map cluster numbers to meaningful labels with more granular categories
     cluster_labels = {
         0: 'SMALL_OFFLINE',
         1: 'MEDIUM_OFFLINE',
         2: 'LARGE_OFFLINE',
         3: 'ONLINE',
-        4: 'PREMIUM_OFFLINE'  # Added for potential additional clusters
+        4: 'PREMIUM_OFFLINE',
+        5: 'SEASONAL_SPECIALIST',
+        6: 'HOLIDAY_SPECIALIST',
+        7: 'REGIONAL_LEADER'
     }
     # Only use the labels that correspond to actual clusters
     actual_labels = {i: cluster_labels[i] for i in range(optimal_clusters)}
