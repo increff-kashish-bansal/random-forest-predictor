@@ -28,4 +28,7 @@ build/
 *.dylib
 *.so
 *.dll
-*.pyd 
+*.pyd
+
+# Data files
+data/merged_sales.csv 
