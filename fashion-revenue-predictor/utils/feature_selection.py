@@ -13,6 +13,7 @@ from pathlib import Path
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import BaseEstimator
 from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
 
 class GroupTimeSeriesSplit:
     """
@@ -318,18 +319,25 @@ def select_features_by_global_shap(
         reverse=True
     )
     
-    # Select top N features
-    selected_features = [f[0] for f in sorted_features[:n_features]]
-    
-    # Log feature selection results
-    logging.info(f"\nSelected {len(selected_features)} features based on global SHAP analysis")
-    logging.info("\nTop 10 most stable features:")
-    for feature, stats in sorted_features[:10]:
-        logging.info(f"{feature}:")
-        logging.info(f"  Mean importance: {stats['mean_importance']:.4f}")
-        logging.info(f"  Std importance: {stats['std_importance']:.4f}")
-        logging.info(f"  Stability score: {stats['stability_score']:.4f}")
-    
+    # Remove unstable features (std > 0.5 * mean)
+    stable_features = [f for f, stats in feature_stability.items() if stats['std_importance'] <= 0.5 * stats['mean_importance']]
+    # Plot top 10 SHAP features with error bars
+    top10 = sorted(feature_stability.items(), key=lambda x: x[1]['mean_importance'], reverse=True)[:10]
+    features_plot = [f[0] for f in top10]
+    means = [f[1]['mean_importance'] for f in top10]
+    stds = [f[1]['std_importance'] for f in top10]
+    plt.figure(figsize=(10, 6))
+    plt.bar(range(len(features_plot)), means, yerr=stds, capsize=5)
+    plt.xticks(range(len(features_plot)), features_plot, rotation=45, ha='right')
+    plt.ylabel('Mean Absolute SHAP Value')
+    plt.title('Top 10 SHAP Features (Mean ± Std across folds)')
+    plt.tight_layout()
+    Path('models').mkdir(exist_ok=True)
+    plt.savefig('models/top10_shap_features.png')
+    plt.close()
+    # Select top N stable features
+    selected_features = [f for f in stable_features if f in [f[0] for f in sorted_features[:n_features]]][:n_features]
+    logging.info(f"Selected {len(selected_features)} stable features after removing unstable ones.")
     return selected_features
 
 def select_features_by_shap(

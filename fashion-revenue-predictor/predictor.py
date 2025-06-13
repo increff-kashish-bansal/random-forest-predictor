@@ -54,6 +54,11 @@ def predict_and_explain(df_X: pd.DataFrame) -> Dict:
     p50 = median_pred
     p90 = median_pred + upper_residuals
     
+    # Ensure p10 < p50 < p90 for all predictions
+    preds = np.vstack([p10, p50, p90])
+    preds_sorted = np.sort(preds, axis=0)
+    p10, p50, p90 = preds_sorted[0], preds_sorted[1], preds_sorted[2]
+    
     # Apply conformal calibration
     calibrator = ConformalCalibrator(alpha=0.1)  # 90% coverage
     

@@ -15,6 +15,7 @@ from sklearn.preprocessing import OneHotEncoder
 from predictor import calculate_prediction_metrics
 from utils.feature_selection import iterative_feature_pruning, select_features_by_global_shap
 import lightgbm as lgb
+import optuna  # Added for hyperparameter tuning
 
 # Remove any existing handlers
 for handler in logging.root.handlers[:]:
@@ -233,7 +234,10 @@ def train_model(df_sales, df_stores):
         # Calculate sample weights
         sample_weights = calculate_sample_weights(df_sales.iloc[sort_idx])
         logging.info("Sample weights calculated with log-based decay and day-of-week weighting")
-        
+
+        # Define y_log before any use
+        y_log = np.log1p(y)
+
         # Common model parameters
         model_params = {
             'n_estimators': 100,  # Increased from 50 for better feature importance estimation
@@ -277,15 +281,14 @@ def train_model(df_sales, df_stores):
         n_splits = 5
         gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
         
-        # 1. Train median model
-        logging.info("\nTraining median model with selected features...")
-        y_log = np.log1p(y)
-        lgb_median_params = {
+        # LightGBM default parameters with regularization and early stopping
+        lgb_base_params = {
             'objective': 'quantile',
-            'alpha': 0.5,
             'metric': 'quantile',
             'boosting_type': 'gbdt',
             'num_leaves': 31,
+            'max_depth': 6,
+            'min_data_in_leaf': 50,
             'learning_rate': 0.05,
             'feature_fraction': 0.9,
             'bagging_fraction': 0.8,
@@ -293,18 +296,80 @@ def train_model(df_sales, df_stores):
             'verbose': -1,
             'seed': 42
         }
+        # If Optuna is available, tune LightGBM hyperparameters for the median model
+        def tune_lgbm(X, y_log, groups, sample_weights):
+            def objective(trial):
+                params = lgb_base_params.copy()
+                params.update({
+                    'num_leaves': trial.suggest_int('num_leaves', 16, 64),
+                    'max_depth': trial.suggest_int('max_depth', 4, 10),
+                    'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 20, 100),
+                    'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+                    'feature_fraction': trial.suggest_float('feature_fraction', 0.7, 1.0),
+                    'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 1.0),
+                })
+                params['alpha'] = 0.5
+                n_splits = 3
+                gtscv = GroupTimeSeriesSplit(n_splits=n_splits, test_size=0.2)
+                scores = []
+                for train_idx, test_idx in gtscv.split(X, groups=groups):
+                    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+                    y_train, y_test = y_log[train_idx], y_log[test_idx]
+                    weights_train = sample_weights[train_idx]
+                    model = lgb.LGBMRegressor(**params, n_estimators=100)
+                    model.fit(
+                        X_train, y_train,
+                        sample_weight=weights_train,
+                        eval_set=[(X_test, y_test)],
+                        eval_sample_weight=[sample_weights[test_idx]],
+                        callbacks=[lgb.early_stopping(50, verbose=False)]
+                    )
+                    y_pred = model.predict(X_test)
+                    y_pred_orig = np.expm1(y_pred)
+                    y_test_orig = np.expm1(y_test)
+                    score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
+                    scores.append(score)
+                return -np.mean(scores)  # Minimize negative R^2
+            study = optuna.create_study(direction='minimize')
+            study.optimize(objective, n_trials=30, show_progress_bar=False)
+            best_params = lgb_base_params.copy()
+            best_params.update(study.best_params)
+            return best_params
+        # Tune or use defaults
+        try:
+            best_lgb_params = tune_lgbm(X[selected_features], y_log, store_ids, sample_weights)
+            logging.info(f"Optuna best LightGBM params: {best_lgb_params}")
+        except Exception as e:
+            logging.warning(f"Optuna tuning failed or not available, using defaults. Error: {e}")
+            best_lgb_params = lgb_base_params.copy()
+        # 1. Train median model
+        logging.info("\nTraining median model with selected features and early stopping...")
+        lgb_median_params = best_lgb_params.copy()
+        lgb_median_params['alpha'] = 0.5
         median_model = lgb.LGBMRegressor(**lgb_median_params, n_estimators=100)
         for train_idx, test_idx in gtscv.split(X[selected_features], groups=store_ids):
             X_train, X_test = X[selected_features].iloc[train_idx], X[selected_features].iloc[test_idx]
             y_train, y_test = y_log[train_idx], y_log[test_idx]
             weights_train = sample_weights[train_idx]
-            median_model.fit(X_train, y_train, sample_weight=weights_train)
+            median_model.fit(
+                X_train, y_train,
+                sample_weight=weights_train,
+                eval_set=[(X_test, y_test)],
+                eval_sample_weight=[sample_weights[test_idx]],
+                callbacks=[lgb.early_stopping(50, verbose=False)]
+            )
             y_pred = median_model.predict(X_test)
             y_pred_orig = np.expm1(y_pred)
             y_test_orig = np.expm1(y_test)
             score = np.corrcoef(y_test_orig, y_pred_orig)[0,1]**2
             cv_scores['median'].append(score)
-        median_model.fit(X[selected_features], y_log, sample_weight=sample_weights)
+        median_model.fit(
+            X[selected_features], y_log,
+            sample_weight=sample_weights,
+            eval_set=[(X[selected_features], y_log)],
+            eval_sample_weight=[sample_weights],
+            callbacks=[lgb.early_stopping(50, verbose=False)]
+        )
         models['median'] = median_model
         median_preds = np.expm1(median_model.predict(X[selected_features]))
         lower_targets = np.clip(median_preds - y, 0, None)
@@ -313,35 +378,74 @@ def train_model(df_sales, df_stores):
         sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
         X_lower, lower_features = select_features_by_importance(X[selected_features], sorted_importances, 'lower')
         X_upper, upper_features = select_features_by_importance(X[selected_features], sorted_importances, 'upper')
+        # Clean lower_targets and upper_targets for NaN/inf (after X_lower/X_upper are defined)
+        lower_mask = np.isfinite(lower_targets)
+        upper_mask = np.isfinite(upper_targets)
+        n_lower_removed = np.sum(~lower_mask)
+        n_upper_removed = np.sum(~upper_mask)
+        if n_lower_removed > 0:
+            logging.warning(f"Removed {n_lower_removed} rows with NaN/inf in lower_targets for quantile model training.")
+        if n_upper_removed > 0:
+            logging.warning(f"Removed {n_upper_removed} rows with NaN/inf in upper_targets for quantile model training.")
+        X_lower_clean = X_lower[lower_mask]
+        lower_targets_clean = lower_targets[lower_mask]
+        X_upper_clean = X_upper[upper_mask]
+        upper_targets_clean = upper_targets[upper_mask]
+        sample_weights_lower = sample_weights[lower_mask]
+        sample_weights_upper = sample_weights[upper_mask]
         # 2. Train lower tail model on residuals
-        logging.info("\nTraining lower tail model with LightGBM quantile regression...")
-        lgb_lower_params = lgb_median_params.copy()
-        lgb_lower_params['alpha'] = 0.1
+        logging.info("\nTraining lower tail model with LightGBM quantile regression and early stopping...")
+        lgb_lower_params = best_lgb_params.copy()
+        lgb_lower_params['alpha'] = 0.05
         lower_model = lgb.LGBMRegressor(**lgb_lower_params, n_estimators=100)
-        for train_idx, test_idx in gtscv.split(X_lower, groups=store_ids):
-            X_train, X_test = X_lower.iloc[train_idx], X_lower.iloc[test_idx]
-            y_train, y_test = lower_targets[train_idx], lower_targets[test_idx]
-            weights_train = sample_weights[train_idx]
-            lower_model.fit(X_train, y_train, sample_weight=weights_train)
+        for train_idx, test_idx in gtscv.split(X_lower_clean, groups=store_ids[lower_mask]):
+            X_train, X_test = X_lower_clean.iloc[train_idx], X_lower_clean.iloc[test_idx]
+            y_train, y_test = lower_targets_clean[train_idx], lower_targets_clean[test_idx]
+            weights_train = sample_weights_lower[train_idx]
+            lower_model.fit(
+                X_train, y_train,
+                sample_weight=weights_train,
+                eval_set=[(X_test, y_test)],
+                eval_sample_weight=[sample_weights_lower[test_idx]],
+                callbacks=[lgb.early_stopping(50, verbose=False)]
+            )
             y_pred = lower_model.predict(X_test)
             score = np.corrcoef(y_test, y_pred)[0,1]**2
             cv_scores['lower'].append(score)
-        lower_model.fit(X_lower, lower_targets, sample_weight=sample_weights)
+        lower_model.fit(
+            X_lower_clean, lower_targets_clean,
+            sample_weight=sample_weights_lower,
+            eval_set=[(X_lower_clean, lower_targets_clean)],
+            eval_sample_weight=[sample_weights_lower],
+            callbacks=[lgb.early_stopping(50, verbose=False)]
+        )
         models['lower'] = lower_model
         # 3. Train upper tail model on residuals
-        logging.info("\nTraining upper tail model with LightGBM quantile regression...")
-        lgb_upper_params = lgb_median_params.copy()
-        lgb_upper_params['alpha'] = 0.9
+        logging.info("\nTraining upper tail model with LightGBM quantile regression and early stopping...")
+        lgb_upper_params = best_lgb_params.copy()
+        lgb_upper_params['alpha'] = 0.95
         upper_model = lgb.LGBMRegressor(**lgb_upper_params, n_estimators=100)
-        for train_idx, test_idx in gtscv.split(X_upper, groups=store_ids):
-            X_train, X_test = X_upper.iloc[train_idx], X_upper.iloc[test_idx]
-            y_train, y_test = upper_targets[train_idx], upper_targets[test_idx]
-            weights_train = sample_weights[train_idx]
-            upper_model.fit(X_train, y_train, sample_weight=weights_train)
+        for train_idx, test_idx in gtscv.split(X_upper_clean, groups=store_ids[upper_mask]):
+            X_train, X_test = X_upper_clean.iloc[train_idx], X_upper_clean.iloc[test_idx]
+            y_train, y_test = upper_targets_clean[train_idx], upper_targets_clean[test_idx]
+            weights_train = sample_weights_upper[train_idx]
+            upper_model.fit(
+                X_train, y_train,
+                sample_weight=weights_train,
+                eval_set=[(X_test, y_test)],
+                eval_sample_weight=[sample_weights_upper[test_idx]],
+                callbacks=[lgb.early_stopping(50, verbose=False)]
+            )
             y_pred = upper_model.predict(X_test)
             score = np.corrcoef(y_test, y_pred)[0,1]**2
             cv_scores['upper'].append(score)
-        upper_model.fit(X_upper, upper_targets, sample_weight=sample_weights)
+        upper_model.fit(
+            X_upper_clean, upper_targets_clean,
+            sample_weight=sample_weights_upper,
+            eval_set=[(X_upper_clean, upper_targets_clean)],
+            eval_sample_weight=[sample_weights_upper],
+            callbacks=[lgb.early_stopping(50, verbose=False)]
+        )
         models['upper'] = upper_model
         
         # Calculate prediction interval metrics
@@ -424,6 +528,24 @@ def train_model(df_sales, df_stores):
         
         logging.info("Models and features saved successfully")
         
+        # 2. After model training, split last 10% of data as test set by date
+        n_test = int(0.1 * len(X))
+        test_idx = np.arange(len(X) - n_test, len(X))
+        train_idx = np.arange(0, len(X) - n_test)
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        # Predict on test set
+        p50_test = np.expm1(median_model.predict(X_test[selected_features]))
+        lower_resid_test = lower_model.predict(X_test[lower_features])
+        upper_resid_test = upper_model.predict(X_test[upper_features])
+        p10_test = p50_test - lower_resid_test
+        p90_test = p50_test + upper_resid_test
+        # Ensure p10 < p50 < p90
+        p10_test, p50_test, p90_test = np.sort(np.vstack([p10_test, p50_test, p90_test]), axis=0)
+        # Calculate metrics
+        future_metrics = calculate_prediction_metrics(y_test, p10_test, p50_test, p90_test)
+        logging.info(f"Future slice metrics (last 10%): {future_metrics}")
+        
         return {
             'cv_scores': cv_scores,
             'feature_importances': sorted_importances,
@@ -440,7 +562,8 @@ def train_model(df_sales, df_stores):
                 'upper': np.mean(cv_scores['upper'])
             },
             'prediction_metrics': avg_metrics,
-            'r2_progression': r2_scores
+            'r2_progression': r2_scores,
+            'future_metrics': future_metrics
         }
     except Exception as e:
         logging.error(f"Error during model training: {str(e)}")
