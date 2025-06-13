@@ -138,21 +138,130 @@ if page == "Upload":
                     
                     # Calculate discount percentage
                     # Ensure we don't divide by zero and handle negative values
-                    df_sales['disc_perc'] = np.where(
-                        (df_sales['revenue'] + df_sales['disc_value']) > 0,
-                        df_sales['disc_value'] * 100 / (df_sales['revenue'] + df_sales['disc_value']),
-                        0
+                    df_sales['disc_perc'] = 0.00
+                    
+                    # Debug prints
+                    st.write("Debug - Before calculation:")
+                    st.write(f"Sample revenue: {df_sales['revenue'].head()}")
+                    st.write(f"Sample disc_value: {df_sales['disc_value'].head()}")
+                    
+                    # Calculate discount percentage
+                    mask = (df_sales['revenue'] + df_sales['disc_value']) > 0
+                    df_sales.loc[mask, 'disc_perc'] = (
+                        df_sales.loc[mask, 'disc_value'] * 100 / 
+                        (df_sales.loc[mask, 'revenue'] + df_sales.loc[mask, 'disc_value'])
                     )
                     
-                    # Ensure discount percentage is between 0 and 1
-                    df_sales['disc_perc'] = df_sales['disc_perc'].clip(0, 1)
+                    # Debug prints
+                    st.write("Debug - After calculation:")
+                    st.write(f"Sample disc_perc: {df_sales['disc_perc'].head()}")
+                    st.write(f"Max disc_perc: {df_sales['disc_perc'].max()}")
+                    st.write(f"Mean disc_perc: {df_sales['disc_perc'].mean()}")
                     
-                    # Log discount statistics for debugging
+                    # Log detailed discount statistics for debugging
                     st.write("Discount Statistics:")
-                    st.write(f"- Min discount: {df_sales['disc_perc'].min():.2%}")
-                    st.write(f"- Max discount: {df_sales['disc_perc'].max():.2%}")
-                    st.write(f"- Mean discount: {df_sales['disc_perc'].mean():.2%}")
+                    st.write(f"- Min discount: {df_sales['disc_perc'].min():.2f}%")
+                    st.write(f"- Max discount: {df_sales['disc_perc'].max():.2f}%")
+                    st.write(f"- Mean discount: {df_sales['disc_perc'].mean():.2f}%")
                     st.write(f"- Number of discounted sales: {len(df_sales[df_sales['disc_perc'] > 0])}")
+                    
+                    # Add detailed debug information
+                    st.write("Debug Information:")
+                    st.write(f"- Total number of sales: {len(df_sales)}")
+                    st.write(f"- Average revenue: ₹{df_sales['revenue'].mean():,.2f}")
+                    st.write(f"- Average discount value: ₹{df_sales['disc_value'].mean():,.2f}")
+                    st.write(f"- Median discount value: ₹{df_sales['disc_value'].median():,.2f}")
+                    
+                    # Add detailed discount analysis
+                    st.write("### Detailed Discount Analysis")
+                    
+                    # 1. Discount Range Distribution
+                    st.write("#### Discount Range Distribution")
+                    discount_ranges = [
+                        (0, 10), (10, 20), (20, 30), (30, 40), (40, 50),
+                        (50, 60), (60, 70), (70, 80), (80, 90), (90, 100)
+                    ]
+                    
+                    range_counts = []
+                    for start, end in discount_ranges:
+                        count = len(df_sales[(df_sales['disc_perc'] > start) & (df_sales['disc_perc'] <= end)])
+                        range_counts.append({
+                            'Range': f'{start}-{end}%',
+                            'Count': count,
+                            'Percentage': (count / len(df_sales)) * 100
+                        })
+                    
+                    range_df = pd.DataFrame(range_counts)
+                    st.dataframe(range_df)
+                    
+                    # 2. High Discount Analysis
+                    st.write("#### High Discount Analysis (>50%)")
+                    high_discounts = df_sales[df_sales['disc_perc'] > 50].copy()
+                    
+                    if not high_discounts.empty:
+                        # Add month and day of week for pattern analysis
+                        high_discounts['month'] = high_discounts['date'].dt.month
+                        high_discounts['day_of_week'] = high_discounts['date'].dt.dayofweek
+                        high_discounts['is_weekend'] = high_discounts['day_of_week'].isin([5, 6]).astype(int)
+                        
+                        # Monthly pattern
+                        st.write("##### Monthly Distribution of High Discounts")
+                        monthly_counts = high_discounts['month'].value_counts().sort_index()
+                        monthly_df = pd.DataFrame({
+                            'Month': monthly_counts.index,
+                            'Count': monthly_counts.values,
+                            'Percentage': (monthly_counts.values / len(high_discounts)) * 100
+                        })
+                        st.dataframe(monthly_df)
+                        
+                        # Weekend vs Weekday pattern
+                        st.write("##### Weekend vs Weekday Distribution")
+                        weekend_counts = high_discounts['is_weekend'].value_counts()
+                        weekend_df = pd.DataFrame({
+                            'Type': ['Weekday', 'Weekend'],
+                            'Count': [weekend_counts[0], weekend_counts[1]],
+                            'Percentage': [(weekend_counts[0] / len(high_discounts)) * 100,
+                                         (weekend_counts[1] / len(high_discounts)) * 100]
+                        })
+                        st.dataframe(weekend_df)
+                        
+                        # Revenue and Discount Value Analysis
+                        st.write("##### Revenue and Discount Value Analysis for High Discounts")
+                        high_discount_metrics = pd.DataFrame({
+                            'Metric': ['Average Revenue', 'Median Revenue', 
+                                     'Average Discount Value', 'Median Discount Value',
+                                     'Average Discount %', 'Median Discount %'],
+                            'Value': [
+                                f"₹{high_discounts['revenue'].mean():,.2f}",
+                                f"₹{high_discounts['revenue'].median():,.2f}",
+                                f"₹{high_discounts['disc_value'].mean():,.2f}",
+                                f"₹{high_discounts['disc_value'].median():,.2f}",
+                                f"{high_discounts['disc_perc'].mean():.2f}%",
+                                f"{high_discounts['disc_perc'].median():.2f}%"
+                            ]
+                        })
+                        st.dataframe(high_discount_metrics)
+                        
+                        # Sample of highest discount sales
+                        st.write("##### Sample of Highest Discount Sales")
+                        highest_discounts = high_discounts.nlargest(5, 'disc_perc')
+                        st.dataframe(highest_discounts[['store', 'date', 'revenue', 'disc_value', 'disc_perc']])
+                    
+                    # Show distribution of discount values
+                    st.write("Discount Value Distribution:")
+                    st.write(df_sales['disc_value'].describe())
+                    
+                    # Show distribution of discount percentages
+                    st.write("Discount Percentage Distribution:")
+                    disc_perc_desc = df_sales['disc_perc'].describe()
+                    disc_perc_desc = disc_perc_desc.apply(lambda x: f"{x:.2f}%")
+                    st.write(disc_perc_desc)
+                    
+                    # Show sample of rows with high discounts
+                    high_discounts = df_sales[df_sales['disc_perc'] > 50].head()
+                    if not high_discounts.empty:
+                        st.write("Sample of High Discount Sales (>50%):")
+                        st.write(high_discounts[['store', 'date', 'revenue', 'disc_value', 'disc_perc']])
                     
                     # Store processed data in session state
                     st.session_state['processed_sales'] = df_sales
@@ -468,7 +577,7 @@ elif page == "Predict":
                             if metrics[('disc_perc', 'count')] > 0:
                                 st.metric(
                                     "Avg Discount",
-                                    f"{metrics[('disc_perc', 'mean')]*100:.1f}%"
+                                    f"{metrics[('disc_perc', 'mean')]:.2f}%"
                                 )
                             else:
                                 st.metric(
@@ -510,7 +619,7 @@ elif page == "Predict":
                             if metrics[('disc_perc', 'count')] > 0:
                                 st.metric(
                                     "Discount",
-                                    f"{metrics[('disc_perc', 'first')]*100:.1f}%"
+                                    f"{metrics[('disc_perc', 'first')]:.2f}%"
                                 )
                             else:
                                 st.metric(
@@ -554,7 +663,7 @@ elif page == "Predict":
                             if metrics[('disc_perc', 'count')] > 0:
                                 st.metric(
                                     "Avg Discount",
-                                    f"{metrics[('disc_perc', 'mean')]*100:.1f}%"
+                                    f"{metrics[('disc_perc', 'mean')]:.2f}%"
                                 )
                             else:
                                 st.metric(
