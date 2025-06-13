@@ -251,6 +251,35 @@ def train_model(df_sales, df_stores):
     importances = dict(zip(X.columns, median_model.feature_importances_))
     sorted_importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
     
+    # Analyze feature importance and variance
+    logging.info("\nFeature Importance Analysis:")
+    logging.info("\nTop 10 Most Important Features:")
+    for feature, importance in list(sorted_importances.items())[:10]:
+        # Calculate feature statistics
+        feature_values = X[feature]
+        variance = feature_values.var()
+        unique_ratio = len(feature_values.unique()) / len(feature_values)
+        zero_ratio = (feature_values == 0).mean()
+        
+        logging.info(f"\nFeature: {feature}")
+        logging.info(f"Importance: {importance:.4f}")
+        logging.info(f"Variance: {variance:.4f}")
+        logging.info(f"Unique Values Ratio: {unique_ratio:.2%}")
+        logging.info(f"Zero Values Ratio: {zero_ratio:.2%}")
+        
+        # Flag potential issues
+        if variance < 0.01:
+            logging.warning(f"Low variance feature: {feature}")
+        if unique_ratio < 0.01:
+            logging.warning(f"Nearly constant feature: {feature}")
+        if zero_ratio > 0.95:
+            logging.warning(f"Mostly zero feature: {feature}")
+    
+    # Log least important features
+    logging.info("\nBottom 10 Least Important Features:")
+    for feature, importance in list(sorted_importances.items())[-10:]:
+        logging.info(f"{feature}: {importance:.4f}")
+    
     # Select features for lower and upper quantile models
     X_lower, selected_features['lower'] = select_features_by_importance(X, sorted_importances, 'lower')
     X_upper, selected_features['upper'] = select_features_by_importance(X, sorted_importances, 'upper')
