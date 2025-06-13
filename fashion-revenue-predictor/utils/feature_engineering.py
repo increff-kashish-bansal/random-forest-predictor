@@ -198,9 +198,27 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
     df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
     
+    # Add 2nd and 3rd harmonic cyclical encodings for day-of-year and week-of-year
+    df['day_of_year'] = df['date'].dt.dayofyear
+    df['week_of_year'] = df['date'].dt.isocalendar().week
+    
+    # 2nd harmonic
+    df['day_of_year_sin2'] = np.sin(4 * np.pi * df['day_of_year'] / 365)
+    df['day_of_year_cos2'] = np.cos(4 * np.pi * df['day_of_year'] / 365)
+    df['week_of_year_sin2'] = np.sin(4 * np.pi * df['week_of_year'] / 52)
+    df['week_of_year_cos2'] = np.cos(4 * np.pi * df['week_of_year'] / 52)
+    
+    # 3rd harmonic
+    df['day_of_year_sin3'] = np.sin(6 * np.pi * df['day_of_year'] / 365)
+    df['day_of_year_cos3'] = np.cos(6 * np.pi * df['day_of_year'] / 365)
+    df['week_of_year_sin3'] = np.sin(6 * np.pi * df['week_of_year'] / 52)
+    df['week_of_year_cos3'] = np.cos(6 * np.pi * df['week_of_year'] / 52)
+    
     features.extend([
         'year', 'month', 'day', 'day_of_week', 'quarter', 'is_weekend',
-        'day_of_week_sin', 'day_of_week_cos', 'month_sin', 'month_cos'
+        'day_of_week_sin', 'day_of_week_cos', 'month_sin', 'month_cos',
+        'day_of_year_sin2', 'day_of_year_cos2', 'week_of_year_sin2', 'week_of_year_cos2',
+        'day_of_year_sin3', 'day_of_year_cos3', 'week_of_year_sin3', 'week_of_year_cos3'
     ])
     
     # --- Weekday × Store Interactions ---
@@ -319,6 +337,51 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     df['discount_pct'] = df['disc_perc'].fillna(0)
     df['discount_pct'] = df['discount_pct'].clip(0, 1)
     df['is_discounted'] = (df['discount_pct'] > 0).astype(int)
+    
+    # Add discount per square foot feature
+    df['discount_per_sqft'] = (df['discount_pct'] * df['revenue']) / df['store_area']
+    features.append('discount_per_sqft')
+    
+    # Add region × channel × month one-hot encoded features
+    logging.info("Adding region × channel × month interaction features...")
+    region_channel_month = pd.get_dummies(
+        df['region'].astype(str) + '_' + 
+        df['channel'].astype(str) + '_' + 
+        df['month'].astype(str),
+        prefix='rcm'
+    )
+    df = pd.concat([df, region_channel_month], axis=1)
+    features.extend(list(region_channel_month.columns))
+    
+    # Add region_weekday_std: std dev of revenue for each region × weekday pair (past 4 weeks rolling)
+    logging.info("Adding region weekday volatility features...")
+    df['region_weekday_std'] = df.groupby(['region', 'day_of_week'])['revenue'].transform(
+        lambda x: x.rolling(window=28, min_periods=1).std().shift(1)
+    )
+    features.append('region_weekday_std')
+    
+    # Add time_since_last_high_revenue: days since last revenue > 90th percentile per store
+    logging.info("Adding time since last high revenue feature...")
+    def time_since_last_high_revenue_transform(rev):
+        pct90 = rev.expanding().quantile(0.9)
+        last_high_idx = -1 * np.ones(len(rev), dtype=int)
+        days_since = np.zeros(len(rev), dtype=int)
+        for i in range(len(rev)):
+            if i == 0:
+                days_since[i] = 0
+            else:
+                if rev.iloc[i-1] > pct90.iloc[i-1]:
+                    last_high_idx[i] = i-1
+                else:
+                    last_high_idx[i] = last_high_idx[i-1]
+                if last_high_idx[i] == -1:
+                    days_since[i] = i
+                else:
+                    days_since[i] = i - last_high_idx[i]
+        return pd.Series(days_since, index=rev.index)
+    
+    df['time_since_last_high_revenue'] = df.groupby('store')['revenue'].transform(time_since_last_high_revenue_transform)
+    features.append('time_since_last_high_revenue')
     
     # 4. Historical Features
     logging.info("Generating historical features...")
