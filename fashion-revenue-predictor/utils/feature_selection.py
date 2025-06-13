@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.base import BaseEstimator
+from sklearn.decomposition import PCA
 
 def remove_near_zero_variance(X: pd.DataFrame, threshold: float = 0.01) -> Tuple[pd.DataFrame, List[str]]:
     """
@@ -412,6 +413,88 @@ def remove_high_vif_features(X: pd.DataFrame, threshold: float = 5.0) -> List[st
         logging.info("Skipping VIF-based feature removal")
         return X.columns.tolist()
 
+def group_correlated_features_pca(X: pd.DataFrame, correlation_threshold: float = 0.7) -> List[str]:
+    """
+    Group correlated features using PCA and correlation analysis.
+    
+    Args:
+        X: Feature matrix
+        correlation_threshold: Threshold for correlation grouping
+        
+    Returns:
+        List of selected feature names
+    """
+    logging.info("Starting PCA-based feature grouping...")
+    
+    # Calculate correlation matrix
+    corr_matrix = X.corr().abs()
+    
+    # Find groups of correlated features
+    feature_groups = {}
+    processed_features = set()
+    
+    for feature in X.columns:
+        if feature in processed_features:
+            continue
+            
+        # Find correlated features
+        correlated = corr_matrix[feature][corr_matrix[feature] > correlation_threshold].index.tolist()
+        if len(correlated) > 1:  # Only create groups with multiple features
+            group_id = f"group_{len(feature_groups)}"
+            feature_groups[group_id] = correlated
+            processed_features.update(correlated)
+    
+    # For each group, apply PCA and select representative features
+    selected_features = []
+    for group_id, features in feature_groups.items():
+        if len(features) <= 2:  # Keep all features if group is small
+            selected_features.extend(features)
+            continue
+            
+        try:
+            # Apply PCA to the feature group
+            X_group = X[features].copy()
+            
+            # Handle any non-numeric columns
+            numeric_cols = X_group.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) < 2:  # Need at least 2 numeric columns for PCA
+                selected_features.extend(features)
+                continue
+                
+            X_group = X_group[numeric_cols]
+            
+            # Fill any missing values
+            X_group = X_group.fillna(X_group.mean())
+            
+            # Apply PCA
+            pca = PCA(n_components=0.95)  # Keep 95% of variance
+            X_pca = pca.fit_transform(X_group)
+            
+            # Calculate feature importance using explained variance ratio
+            importance = np.abs(pca.components_) * pca.explained_variance_ratio_[:, np.newaxis]
+            feature_importance = np.sum(importance, axis=0)
+            
+            # Select top 2 features based on importance
+            top_indices = np.argsort(feature_importance)[-2:]
+            selected_features.extend([numeric_cols[i] for i in top_indices])
+            
+            logging.info(f"Group {group_id}: Selected {len(top_indices)} features from {len(features)} correlated features")
+            
+        except Exception as e:
+            logging.warning(f"Error processing group {group_id}: {str(e)}")
+            # If PCA fails, keep all features from this group
+            selected_features.extend(features)
+    
+    # Add ungrouped features
+    ungrouped_features = set(X.columns) - processed_features
+    selected_features.extend(list(ungrouped_features))
+    
+    # Remove any duplicates while preserving order
+    selected_features = list(dict.fromkeys(selected_features))
+    
+    logging.info(f"Selected {len(selected_features)} features from {len(X.columns)} total features")
+    return selected_features
+
 def iterative_feature_pruning(X: pd.DataFrame, y: pd.Series, model_params: dict, n_iter: int = 10) -> Tuple[RandomForestRegressor, List[str], List[float]]:
     """
     Iteratively prune features using multiple methods.
@@ -451,11 +534,11 @@ def iterative_feature_pruning(X: pd.DataFrame, y: pd.Series, model_params: dict,
         logging.info(f"Current feature count: {len(current_features)}")
         
         try:
-            # 1. Remove highly correlated features
-            logging.info("Starting correlation analysis with threshold 0.95...")
+            # 1. Group correlated features using PCA
+            logging.info("Starting PCA-based feature grouping...")
             X_current = X[current_features]
-            current_features = remove_correlated_features(X_current, threshold=0.95)
-            logging.info(f"Features after correlation pruning: {len(current_features)}")
+            current_features = group_correlated_features_pca(X_current, correlation_threshold=0.7)
+            logging.info(f"Features after PCA grouping: {len(current_features)}")
             
             # 2. Remove features with high VIF (only for numeric features)
             logging.info("Starting VIF analysis...")
