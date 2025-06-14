@@ -259,7 +259,7 @@ def add_same_day_revenue_last_year(df, historical_sales):
     df['same_day_revenue_last_year'] = df.apply(get_last_year, axis=1)
     store_avg = historical_sales.groupby('store')['revenue'].mean()
     df['same_day_revenue_last_year'] = df.apply(
-        lambda row: store_avg[row['store']] if pd.isna(row['same_day_revenue_last_year']) else row['same_day_revenue_last_year'],
+        lambda row: store_avg.get(row['store'], store_avg.mean()) if pd.isna(row['same_day_revenue_last_year']) else row['same_day_revenue_last_year'],
         axis=1
     )
     return df
@@ -326,6 +326,27 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     logging.info(f"Merged data shape: {df.shape}")
     logging.info("Column types after merge:")
     logging.info(df.dtypes)
+    
+    # --- DEBUG: Log columns after merge ---
+    temporal_cols = ['year', 'month', 'day', 'day_of_week', 'quarter', 'is_weekend',
+                     'day_of_week_sin', 'day_of_week_cos', 'month_sin', 'month_cos']
+    logging.info(f"Columns after merge: {list(df.columns)}")
+    missing_temporal = [col for col in temporal_cols if col not in df.columns]
+    if missing_temporal:
+        logging.warning(f"Missing temporal columns after merge: {missing_temporal}")
+
+    # --- FINAL: Recalculate all temporal features from date to guarantee presence ---
+    df['date'] = pd.to_datetime(df['date'])
+    df['year'] = df['date'].dt.year
+    df['month'] = df['date'].dt.month
+    df['day'] = df['date'].dt.day
+    df['day_of_week'] = df['date'].dt.dayofweek
+    df['quarter'] = df['date'].dt.quarter
+    df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+    df['day_of_week_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+    df['day_of_week_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
     
     features = []
     
@@ -988,13 +1009,23 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     df['days_to_festival'] = df['date'].apply(lambda d: min([(f - d).days for f in festival_dates if (f - d).days >= 0] or [365]))
     features.extend(['is_festival', 'days_to_festival'])
 
-    # Revenue percentile rank per store
-    df['revenue_percentile'] = df.groupby('store')['revenue'].rank(pct=True)
-    features.append('revenue_percentile')
-
     # Weekday-holiday interaction
     df['is_weekday_festival'] = ((df['is_festival'] == 1) & (df['day_of_week'] < 5)).astype(int)
     features.append('is_weekday_festival')
+
+    # --- Add rolling rank feature ---
+    df = df.sort_values(['store', 'date'])
+    def rolling_rank_30d(x):
+        return x.rolling(window=30, min_periods=1).apply(lambda s: (s.rank(pct=True).iloc[-1]), raw=False)
+    df['revenue_rolling_rank_30d'] = df.groupby('store')['revenue'].transform(rolling_rank_30d)
+    # Fill missing with store_month_avg
+    df['revenue_rolling_rank_30d'] = df['revenue_rolling_rank_30d'].fillna(df['store_month_avg'])
+    features.append('revenue_rolling_rank_30d')
+
+    # --- Add 90d median feature ---
+    df['revenue_median_last_90d'] = df.groupby('store')['revenue'].transform(lambda x: x.rolling(window=90, min_periods=1).median())
+    df['revenue_median_last_90d'] = df['revenue_median_last_90d'].fillna(df['store_month_avg'])
+    features.append('revenue_median_last_90d')
 
     # --- FIX: Always assign X before is_prediction logic ---
     X = df[features]
@@ -1006,22 +1037,14 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         except FileNotFoundError:
             raise ValueError("Feature names file not found. Please train the model first.")
         all_features = saved_features.get('all_features', [])
-        # Remove lag-based and rolling features from X and features
-        lag_rolling_patterns = [
-            'revenue_lag_', 'revenue_rolling_', 'store_weekday_', 'revenue_week_over_week',
-            'revenue_day_over_day', 'revenue_last_3_days', 'revenue_volatility_3d',
-            'revenue_lag_diff_', 'revenue_lag_7_percentile', 'region_weekday_std',
-            'region_weekday_volatility', 'time_since_last_high_revenue', 'time_since_last_peak_revenue',
-            'demand_trend', 'revenue_median', 'revenue_std', 'store_month_revenue_median',
-            'store_month_revenue_std', 'same_dayofyear_avg_3y', 'same_dayofyear_delta_vs_month',
-            'discount_rolling_mean_14d', 'discount_rolling_std_14d', 'revenue_rolling_mean_90d'
-        ]
-        drop_cols = [col for col in X.columns if any(pat in col for pat in lag_rolling_patterns)]
-        X = X.drop(columns=drop_cols, errors='ignore')
-        features = [f for f in features if not any(pat in f for pat in lag_rolling_patterns)]
-        # Only add missing features that are not in drop_cols
-        filtered_features = [col for col in all_features if col in X.columns]
-        X = X.reindex(columns=filtered_features, fill_value=0)
+        X = X.copy()  # Avoid SettingWithCopyWarning when adding columns
+        for col in all_features:
+            if col not in X.columns:
+                X.loc[:, col] = 0  # Avoid SettingWithCopyWarning
+        extra_cols = [col for col in X.columns if col not in all_features]
+        if extra_cols:
+            X = X.drop(columns=extra_cols)
+        X = X[all_features]
     
     logging.info(f"Final feature count: {len(features)}")
     logging.info(f"Final feature matrix shape: {X.shape}")
@@ -1074,6 +1097,12 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         return pd.Series(percentiles, index=rev.index)
     df['revenue_lag_7_percentile'] = df.groupby('store')['revenue'].transform(lag_7_percentile_transform)
     features.append('revenue_lag_7_percentile')
+    
+    # --- Before zero-filling, log missing columns ---
+    if is_prediction:
+        missing_cols = [col for col in all_features if col not in X.columns]
+        if missing_cols:
+            logging.warning(f"Missing columns before zero-fill: {missing_cols}")
     
     # Clean feature matrix: replace inf/-inf with nan, then fillna(0)
     if isinstance(X, pd.DataFrame):
@@ -1153,5 +1182,36 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     if historical_sales is not None:
         df = add_same_day_revenue_last_year(df, historical_sales)
         features.append('same_day_revenue_last_year')
+    
+    # --- Lag/rolling/diff feature null patching ---
+    lag_rolling_patterns = [
+        'revenue_lag_', 'revenue_lag_diff_', 'revenue_rolling_mean_', 'revenue_rolling_std_'
+    ]
+    for col in X.columns:
+        if any(pat in col for pat in lag_rolling_patterns):
+            if X[col].isna().any():
+                if 'store_month_avg' in X.columns:
+                    X[col] = X[col].fillna(X['store_month_avg'])
+                else:
+                    X[col] = X[col].fillna(0)
+                import warnings
+                warnings.warn(f"Patched NaNs in {col} with store_month_avg or 0.")
+    
+    # --- DEBUG: Log columns after all temporal features are generated ---
+    temporal_cols = ['year', 'month', 'day', 'day_of_week', 'quarter', 'is_weekend',
+                     'day_of_week_sin', 'day_of_week_cos', 'month_sin', 'month_cos']
+    missing_temporal = [col for col in temporal_cols if col not in df.columns]
+    if missing_temporal:
+        logging.warning(f"Missing temporal columns after generating features: {missing_temporal}")
+
+    # --- After SHAP-based feature pruning, forcibly re-add anchor features ---
+    anchor_features = [
+        'revenue_lag_7', 'store_dayofweek_avg', 'discount_pct', 'store_month_avg', 'revenue_rolling_mean_7d'
+    ]
+    for anchor in anchor_features:
+        if anchor not in X.columns:
+            X[anchor] = 0
+        if anchor not in features:
+            features.append(anchor)
     
     return X, features

@@ -19,6 +19,8 @@ import optuna  # Added for hyperparameter tuning
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.inspection import permutation_importance
+import shap
+import os
 
 # Remove any existing handlers
 for handler in logging.root.handlers[:]:
@@ -232,10 +234,10 @@ def train_model(df_sales, df_stores):
     revenue_ratio = df_sales['revenue'] / df_sales['store_dayofweek_avg']
     y = revenue_ratio
 
-    # Calculate revenue percentile for classification-style prediction
-    df_sales['revenue_percentile'] = df_sales.groupby('store')['revenue'].rank(pct=True)
-    logging.info(f"Sample revenue_percentile values: {df_sales['revenue_percentile'].head()}")
-
+    # Remove calculation and logging of revenue_percentile
+    if 'revenue_percentile' in df_sales.columns:
+        df_sales = df_sales.drop(columns=['revenue_percentile'])
+    
     # Derive features
     logging.info("Deriving features...")
     X, features = derive_features(df_sales, df_stores, is_prediction=False)
@@ -271,6 +273,74 @@ def train_model(df_sales, df_stores):
     key_features = ['revenue_lag_7', 'revenue_rolling_mean_7d', 'discount_pct', 'weekday_store_avg']
     X_selected, selected_features = drop_low_importance_features(rf_median, X_selected, threshold=0.001, keep_features=key_features)
 
+    # --- Remove leaky feature if present ---
+    if 'revenue_percentile' in X_selected.columns:
+        X_selected = X_selected.drop(columns=['revenue_percentile'])
+        if 'revenue_percentile' in selected_features:
+            selected_features.remove('revenue_percentile')
+
+    # --- (3) Ensure volatility features are included in lower/upper model features ---
+    volatility_features = [
+        'revenue_volatility_3d',
+        'revenue_week_over_week',
+        'revenue_day_over_day'
+    ]
+    for feat in volatility_features:
+        if feat not in X_selected.columns and feat in X.columns:
+            X_selected[feat] = X[feat]
+        if feat not in selected_features:
+            selected_features.append(feat)
+    # --- Drop low-importance features after SHAP ---
+    try:
+        X_selected = X_selected.astype(float)
+        X_selected = X_selected.replace([np.inf, -np.inf], np.nan).fillna(0)
+        explainer = shap.TreeExplainer(rf_median)
+        shap_values = explainer.shap_values(X_selected, check_additivity=False)
+        feature_importance = np.abs(shap_values).mean(axis=0)
+        sorted_importance = sorted(zip(X_selected.columns, feature_importance), key=lambda x: x[1], reverse=True)
+        top_10 = [f for f in sorted_importance if f[0] != 'revenue_percentile'][:10]
+        logging.info('Top 10 SHAP features after removing revenue_percentile:')
+        for feat, val in top_10:
+            logging.info(f'{feat}: {val:.3f}')
+        # Drop low-importance features
+        if sorted_importance:
+            max_importance = max([v for _, v in sorted_importance])
+            low_shap_features = [f for f, v in sorted_importance if v < 0.01 * max_importance]
+            if low_shap_features:
+                logging.info(f"Dropped low-SHAP features: {low_shap_features}")
+            actually_dropped = [col for col in low_shap_features if col in X_selected.columns]
+            if actually_dropped:
+                logging.info(f"Dropped low-SHAP features: {actually_dropped}")
+            X_selected = X_selected.drop(columns=low_shap_features, errors='ignore')
+    except Exception as e:
+        logging.warning(f"SHAP feature importance logging or feature dropping skipped due to error: {e}")
+    # --- Always add back stable anchors (never drop, even if sparse/low-SHAP) ---
+    stable_anchors = [
+        'revenue_lag_7', 'revenue_rolling_mean_7d', 'discount_pct', 'store_month_avg', 'weekday_store_ord',
+        'year', 'day_of_week', 'quarter', 'is_weekend', 'day_of_week_sin', 'day_of_week_cos', 'month_sin', 'month_cos'
+    ]
+    for anchor in stable_anchors:
+        if anchor not in X_selected.columns and anchor in X.columns:
+            X_selected[anchor] = X[anchor]
+        if anchor not in selected_features:
+            selected_features.append(anchor)
+    # --- Final robust feature alignment for training ---
+    # Only save and use columns actually present in X_selected
+    final_features = X_selected.columns.tolist()
+    import json
+    with open('models/brandA_feature_names.json', 'w') as f:
+        json.dump({'all_features': final_features}, f)
+    # Fit model on exactly these columns
+    X_selected = X_selected[final_features]
+
+    # --- Regularize Random Forest ---
+    rf_median = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
+    rf_lower = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
+    rf_upper = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
+
+    # --- Never allow NaN in X_selected before fitting ---
+    X_selected = X_selected.replace([np.inf, -np.inf], np.nan).fillna(0)
+
     # Re-split after feature selection
     X_train, X_test, y_train, y_test = train_test_split(
         X_selected, y, test_size=0.2, random_state=42
@@ -283,15 +353,43 @@ def train_model(df_sales, df_stores):
     residuals_train = y_train - median_pred_train
     residuals_test = y_test - median_pred_test
 
-    lower_targets_train = np.clip(residuals_train, a_max=0, a_min=None) * -1
+    # --- (4) Smooth residuals using rolling median (window=7) ---
+    def smooth_residuals(residuals, window=7):
+        return pd.Series(residuals).rolling(window=window, min_periods=1, center=True).median().values
+
+    smoothed_abs_residuals_train = smooth_residuals(np.abs(residuals_train))
+    smoothed_abs_residuals_test = smooth_residuals(np.abs(residuals_test))
+
+    # --- (1) Redefine lower/upper model targets as smoothed abs residuals ---
+    lower_targets_train = smoothed_abs_residuals_train
+    upper_targets_train = smoothed_abs_residuals_train
+
+    # Fit lower/upper models
     rf_lower.fit(X_train, lower_targets_train)
     lower_pred_train = rf_lower.predict(X_train)
     lower_pred_test = rf_lower.predict(X_test)
 
-    upper_targets_train = np.clip(residuals_train, a_min=0, a_max=None)
     rf_upper.fit(X_train, upper_targets_train)
     upper_pred_train = rf_upper.predict(X_train)
     upper_pred_test = rf_upper.predict(X_test)
+
+    # --- (2) Log and penalize coverage misses during tail model training ---
+    # Compute prediction intervals
+    p10_train = median_pred_train - lower_pred_train
+    p90_train = median_pred_train + upper_pred_train
+    coverage_misses = (y_train < p10_train) | (y_train > p90_train)
+    # Align mask index with sample_weights_tail
+    coverage_misses = pd.Series(coverage_misses, index=y_train.index)
+    coverage_miss_rate = np.mean(coverage_misses)
+    logging.info(f"Coverage miss rate during training: {coverage_miss_rate:.2%} ({coverage_misses.sum()} / {len(y_train)})")
+    # Optionally, increase sample weights for misses (simple boost)
+    sample_weights_tail = sample_weights.copy()
+    sample_weights_tail = pd.Series(sample_weights_tail, index=y_train.index)
+    sample_weights_tail.loc[coverage_misses] *= 2  # Double weight for misses
+    sample_weights_tail = sample_weights_tail.values  # Convert back to np.ndarray if needed
+    # Optionally refit lower/upper with boosted weights (uncomment if desired):
+    # rf_lower.fit(X_train, lower_targets_train, sample_weight=sample_weights_tail)
+    # rf_upper.fit(X_train, upper_targets_train, sample_weight=sample_weights_tail)
 
     # Compute R² scores
     train_scores = {
@@ -301,8 +399,8 @@ def train_model(df_sales, df_stores):
     }
     test_scores = {
         'median': r2_score(y_test, median_pred_test),
-        'lower': r2_score(np.clip(y_test - median_pred_test, a_max=0, a_min=None) * -1, lower_pred_test),
-        'upper': r2_score(np.clip(y_test - median_pred_test, a_min=0, a_max=None), upper_pred_test)
+        'lower': r2_score(smoothed_abs_residuals_test, lower_pred_test),
+        'upper': r2_score(smoothed_abs_residuals_test, upper_pred_test)
     }
 
     # Compute test set prediction intervals for metrics
@@ -317,10 +415,16 @@ def train_model(df_sales, df_stores):
     joblib.dump({'median': rf_median, 'lower': rf_lower, 'upper': rf_upper}, 'models/brandA_model.pkl')
     logging.info("Saved Random Forest models to models/brandA_model.pkl")
 
-    # Save feature names used for training
-    with open('models/brandA_feature_names.json', 'w') as f:
-        json.dump({'all_features': selected_features}, f)
-    logging.info("Saved feature names to models/brandA_feature_names.json")
+    # Save feature percentiles for robust prediction-time clipping
+    percentiles = {}
+    for col in X_selected.columns:
+        percentiles[col] = {
+            'p1': float(np.percentile(X_selected[col], 1)),
+            'p99': float(np.percentile(X_selected[col], 99))
+        }
+    with open('models/brandA_feature_percentiles.json', 'w') as f:
+        json.dump(percentiles, f)
+    logging.info("Saved feature percentiles to models/brandA_feature_percentiles.json")
 
     # Get feature importances from the median model
     importances = rf_median.feature_importances_
@@ -333,6 +437,8 @@ def train_model(df_sales, df_stores):
     logging.info('Top 20 permutation importance features:')
     for feat, score in top_20_perm:
         logging.info(f'{feat}: {score:.4f}')
+    
+    os.makedirs('models', exist_ok=True)
     
     return {
         'selected_features': selected_features,

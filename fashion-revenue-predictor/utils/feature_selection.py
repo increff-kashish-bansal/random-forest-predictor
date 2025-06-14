@@ -337,7 +337,15 @@ def select_features_by_global_shap(
     plt.close()
     # Select top N stable features
     selected_features = [f for f in stable_features if f in [f[0] for f in sorted_features[:n_features]]][:n_features]
-    logging.info(f"Selected {len(selected_features)} stable features after removing unstable ones.")
+    # --- ENFORCE always-included features and drop leaky feature ---
+    always_include = ['store_month_avg', 'revenue_rolling_rank_30d', 'revenue_median_last_90d']
+    for f in always_include:
+        if f not in selected_features and f in X.columns:
+            selected_features.append(f)
+    # --- REMOVE revenue_percentile from selected features if present ---
+    if 'revenue_percentile' in selected_features:
+        selected_features.remove('revenue_percentile')
+    logging.info(f"Selected {len(selected_features)} stable features after removing unstable ones and enforcing always-included features.")
     return selected_features
 
 def select_features_by_shap(
@@ -748,4 +756,20 @@ def iterative_feature_pruning(X: pd.DataFrame, y: pd.Series, model_params: dict,
     logging.info(f"Final feature count: {len(best_features)}")
     logging.info(f"Best R² score: {best_score:.4f}")
     
-    return best_model, best_features, r2_scores 
+    return best_model, best_features, r2_scores
+
+def drop_low_importance_features(model, X, threshold=0.001, keep_features=None):
+    """
+    Drop features with feature_importances_ < threshold, but always keep key features.
+    Args:
+        model: Trained model with feature_importances_
+        X: Feature DataFrame
+        threshold: Importance threshold
+        keep_features: List of features to always keep
+    Returns:
+        (X_filtered, kept_features): DataFrame and list of kept feature names
+    """
+    keep_features = set(keep_features or [])
+    importances = model.feature_importances_
+    to_keep = [f for f, imp in zip(X.columns, importances) if imp >= threshold or f in keep_features]
+    return X[to_keep], to_keep 

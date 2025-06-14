@@ -1,32 +1,35 @@
 import logging
+import pandas as pd
 import numpy as np
-from scipy.stats import median_abs_deviation
-from conformal_calibration import ConformalCalibrator
+from predictor import predict_and_explain
+from utils.feature_engineering import derive_features
 
-# Calculate prediction intervals
-logging.info("Calculating prediction intervals...")
-p50 = median_pred
-p10 = p50 - lower_residuals
-p90 = p50 + upper_residuals
-
-# Apply conformal calibration
-logging.info("Applying conformal calibration...")
-calibrator = ConformalCalibrator(alpha=0.1)  # 90% coverage
-calibrator.calibrate(log_y, p10, p50, p90)  # Fit on historical data
-p10_calibrated, p50_calibrated, p90_calibrated = calibrator.calibrate_predictions(
-    p10, p50, p90
-)
-
-# Convert back to original scale using relative modeling
-p10_calibrated = np.expm1(p10_calibrated) * avg_day_month_revenue
-p50_calibrated = np.expm1(p50_calibrated) * avg_day_month_revenue
-p90_calibrated = np.expm1(p90_calibrated) * avg_day_month_revenue
-
-# Create prediction result
-prediction = {
-    'store': store_id,
-    'date': prediction_date,
-    'p10': float(p10_calibrated[0]),
-    'p50': float(p50_calibrated[0]),
-    'p90': float(p90_calibrated[0])
-} 
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    # Example: generate a synthetic prediction for a single store and date
+    store_id = "STORE_1"
+    prediction_date = pd.Timestamp.today().normalize() + pd.Timedelta(days=7)
+    # Minimal synthetic sales and store data
+    synthetic_sales = pd.DataFrame({
+        'store': [store_id],
+        'date': [prediction_date],
+        'qty_sold': [0],
+        'revenue': [0],
+        'disc_value': [0],
+        'disc_perc': [0]
+    })
+    synthetic_stores = pd.DataFrame({
+        'id': [store_id],
+        'channel': ['ONLINE'],
+        'city': ['MUMBAI'],
+        'region': ['NORTH1'],
+        'store_area': [2000],
+        'is_online': [1]
+    })
+    # For demo, no historical sales
+    historical_sales = None
+    # Derive features
+    X_pred, _ = derive_features(synthetic_sales, synthetic_stores, historical_sales=historical_sales, is_prediction=True)
+    # Run prediction
+    results = predict_and_explain(X_pred, historical_sales=historical_sales, original_input=synthetic_sales)
+    print("Prediction result:", results) 

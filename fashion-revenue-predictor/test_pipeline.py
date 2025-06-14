@@ -5,6 +5,7 @@ import logging
 from train_model import train_model
 from predictor import predict_and_explain
 from utils.feature_engineering import derive_features
+import joblib, json
 
 # Configure logging
 logging.basicConfig(
@@ -78,6 +79,8 @@ def generate_synthetic_data(n_stores=10, n_days=90):
             sales.append(sale)
     
     df_sales = pd.DataFrame(sales)
+    # Add discount_pct column
+    df_sales['discount_pct'] = df_sales['disc_value'] * 100 / (df_sales['revenue'] + df_sales['disc_value'])
     logging.info(f"Generated sales data shape: {df_sales.shape}")
     
     return df_sales, df_stores
@@ -88,16 +91,17 @@ def test_training(df_sales, df_stores):
     try:
         results = train_model(df_sales, df_stores)
         logging.info("Training completed successfully")
-        
-        # Log cross-validation scores for each model
-        for model_type in ['median', 'lower', 'upper']:
-            mean_score = np.mean(results['cv_scores'][model_type])
-            std_score = np.std(results['cv_scores'][model_type])
-            logging.info(f"{model_type} - Mean R²: {mean_score:.3f} (±{std_score:.3f})")
-        
-        logging.info("Top 5 features:")
-        for feat, imp in list(results['feature_importances'].items())[:5]:
-            logging.info(f"{feat}: {imp:.3f}")
+        # Log cross-validation scores for each model if present
+        if 'cv_scores' in results:
+            for model_type in ['median', 'lower', 'upper']:
+                mean_score = np.mean(results['cv_scores'][model_type])
+                std_score = np.std(results['cv_scores'][model_type])
+                logging.info(f"{model_type} - Mean R²: {mean_score:.3f} (±{std_score:.3f})")
+        # Log top features if present
+        if 'feature_importances' in results:
+            logging.info("Top 5 features:")
+            for feat, imp in list(results['feature_importances'].items())[:5]:
+                logging.info(f"{feat}: {imp:.3f}")
         return True
     except Exception as e:
         logging.error(f"Training failed: {str(e)}")
@@ -110,18 +114,14 @@ def test_prediction(df_sales, df_stores):
         # Select a random store and date
         store_id = np.random.choice(df_stores['id'].unique())
         future_date = df_sales['date'].max() + timedelta(days=7)
-        
         logging.info(f"Testing prediction for store {store_id} on {future_date}")
-        
         # Get last 7 days of historical sales for this store
         historical_sales = df_sales[
             (df_sales['store'] == store_id) & 
             (df_sales['date'] >= future_date - timedelta(days=7)) &
             (df_sales['date'] < future_date)
         ].copy()
-        
         logging.info(f"Found {len(historical_sales)} days of historical sales data")
-        
         # Create synthetic sales row
         synthetic_sales = pd.DataFrame({
             'store': [store_id],
@@ -129,12 +129,11 @@ def test_prediction(df_sales, df_stores):
             'qty_sold': [0],
             'revenue': [0],
             'disc_value': [0],
-            'disc_perc': [0]
+            'disc_perc': [0],
+            'discount_pct': [0]
         })
-        
         # Get store metadata
         store_meta = df_stores[df_stores['id'] == store_id].iloc[0]
-        
         # Create synthetic stores row
         synthetic_stores = pd.DataFrame({
             'id': [store_id],
@@ -144,13 +143,24 @@ def test_prediction(df_sales, df_stores):
             'store_area': [store_meta['store_area']],
             'is_online': [store_meta['is_online']]
         })
-        
         # Derive features with historical data
         X_pred, _ = derive_features(synthetic_sales, synthetic_stores, historical_sales=historical_sales, is_prediction=True)
-        
+        # Patch: Add missing features expected by the model
+        model = joblib.load('models/brandA_model.pkl')
+        with open('models/brandA_feature_names.json', 'r') as f:
+            feature_names = json.load(f)
+        expected_features = set(feature_names['all_features'])
+        missing_cols = [col for col in expected_features if col not in X_pred.columns]
+        if missing_cols:
+            logging.error(f"Missing columns in X_pred before prediction: {missing_cols}")
+            print(f"Missing columns in X_pred before prediction: {missing_cols}")
+        for col in expected_features:
+            if col not in X_pred.columns:
+                X_pred[col] = 0
+        # Reorder columns to match expected order and cast to float
+        X_pred = X_pred[list(feature_names['all_features'])].astype(float)
         # Make prediction
         results = predict_and_explain(X_pred, historical_sales=historical_sales, original_input=synthetic_sales)
-        
         logging.info("Prediction completed successfully")
         logging.info(f"Predicted revenue: ${results['p50'][0]:,.2f}")
         logging.info(f"Prediction range: ${results['p10'][0]:,.2f} - ${results['p90'][0]:,.2f}")

@@ -6,10 +6,20 @@ A Streamlit-based web application for predicting fashion retail revenue using ma
 
 - Data upload and validation
 - Automatic column mapping
-- Model training with feature importance visualization
-- Revenue prediction with confidence intervals
-- Historical data comparison
+- Advanced model training with:
+  - LightGBM and Random Forest ensemble
+  - Hyperparameter optimization using Optuna
+  - Feature importance visualization with SHAP values
+  - Time-based sample weighting
+  - Dynamic test size based on data length
+- Sophisticated revenue prediction with:
+  - P10, P50, and P90 confidence intervals
+  - Conformal calibration for reliable intervals
+  - Store-specific seasonal adjustments
+  - Historical data comparison
+  - Dynamic confidence bands based on store history
 - Interactive UI with Streamlit
+- Comprehensive logging and debugging
 
 ## Data Requirements
 
@@ -57,17 +67,48 @@ streamlit run app.py
 2. **Train Model**
    - After successful data upload, navigate to the Train page
    - Click "Train Model" to start the training process
-   - View training results and feature importances
+   - View training results, including:
+     - Model performance metrics
+     - Feature importance rankings
+     - Training logs and debugging information
 
 3. **Make Predictions**
    - Select a store and future date
    - Adjust store area and discount percentage if needed
-   - Get revenue predictions with confidence intervals
+   - Get revenue predictions with:
+     - P10 (lower bound)
+     - P50 (median prediction)
+     - P90 (upper bound)
+   - View SHAP explanations for predictions
    - Compare with historical data
+
+## Advanced Features
+
+- **Time-based Weighting**: Recent data points are weighted more heavily in training
+- **Dynamic Test Size**: Test set size adapts based on available historical data
+- **Conformal Calibration**: Ensures prediction intervals maintain desired coverage
+- **Store-specific Adjustments**: 
+  - Seasonal indices by store, month, and weekday
+  - Historical revenue floors for P10 predictions
+  - Store-specific volatility adjustments
+- **Feature Engineering**:
+  - Rolling statistics (3-day, 7-day, 14-day, 30-day)
+  - Store clustering
+  - Channel and region-specific discount normalization
+  - Premium location adjustments
 
 ## Notes
 
-- The model uses Random Forest for prediction
-- Predictions include P10, P50, and P90 confidence intervals
+- The model uses an ensemble of LightGBM and Random Forest for prediction
+- Predictions include P10, P50, and P90 confidence intervals with conformal calibration
 - Historical comparisons show same-day/month data from previous years
 - High discount values (>50%) may affect prediction accuracy
+- Training logs are saved to `training.log` for debugging and analysis
+
+## Performance Considerations
+
+- The model automatically handles outliers and missing values
+- Low-activity days (revenue < 100) are filtered out during training
+- Store-specific seasonal patterns are incorporated into predictions
+- Confidence intervals are dynamically adjusted based on historical volatility
+- Fallback mechanisms ensure reasonable predictions even with limited data
