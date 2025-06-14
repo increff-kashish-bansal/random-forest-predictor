@@ -5,9 +5,10 @@ import pandas as pd
 import shap
 from typing import Dict, List, Tuple
 from scipy.special import inv_boxcox
-from utils.feature_engineering import apply_cluster_specific_transforms
+from utils.feature_engineering import apply_cluster_specific_transforms, align_features
 from utils.conformal_calibration import ConformalCalibrator
 import logging
+import warnings
 
 def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = None, original_input: pd.DataFrame = None) -> Dict:
     """
@@ -25,9 +26,12 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
         - Top 5 most important features
     """
     # Load models and features
-    models = joblib.load('models/brandA_models.pkl')
+    models = joblib.load('models/brandA_model.pkl')
     with open('models/brandA_feature_names.json', 'r') as f:
         feature_names = json.load(f)
+    
+    # Lock feature set for inference
+    df_X = align_features(df_X)
     
     # Debug: Print input features
     numeric_X = df_X[feature_names['all_features']].apply(pd.to_numeric, errors='coerce')
@@ -88,42 +92,44 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
         if 'store_month_weekday_avg' not in df_X.columns:
             df_X['store_month_weekday_avg'] = 0
 
-    # Get predictions from each model using appropriate feature sets
-    # 1. Median predictions (log scale)
-    median_raw = models['median'].predict(df_X[feature_names['all_features']])
-    print("DEBUG: Raw median model output:", median_raw)
-    
-    # 2. Lower tail predictions (residuals)
-    lower_residuals = models['lower'].predict(df_X[feature_names['lower_features']])
-    
-    # 3. Upper tail predictions (residuals)
-    upper_residuals = models['upper'].predict(df_X[feature_names['upper_features']])
-    
-    # Sanity check: Clip raw outputs to reasonable range before expm1
-    median_raw = np.clip(median_raw, -10, 20)
-    median_pred = np.expm1(median_raw)
-    # Cap residuals at ±50% of median_pred
-    lower_residuals = np.clip(lower_residuals, 0, 0.5 * median_pred)
-    upper_residuals = np.clip(upper_residuals, 0, 0.5 * median_pred)
-
-    logging.debug(f"Raw median_pred: {median_pred}")
-    logging.debug(f"Lower residuals (capped): {lower_residuals}")
-    logging.debug(f"Upper residuals (capped): {upper_residuals}")
-
-    # Calculate initial prediction intervals
-    p10 = np.maximum(median_pred - lower_residuals, 0)  # Ensure non-negative
-    p50 = median_pred
-    p90 = median_pred + upper_residuals
+    # Predict revenue ratio with Random Forest models
+    X_pred = df_X[feature_names['all_features']]
+    rf_pred = models['median'].predict(X_pred)
+    # Invert: pred_revenue = pred_ratio * store_dayofweek_avg
+    store_dayofweek_avg = df_X['store_dayofweek_avg'].values
+    rf_revenue = rf_pred * store_dayofweek_avg
+    # Ensemble with seasonal baseline
+    p50 = 0.5 * rf_revenue + 0.5 * store_dayofweek_avg
+    # Confidence bands: use historical residual std per store+day_of_week
+    if historical_sales is not None and 'store' in df_X.columns and 'day_of_week' in df_X.columns:
+        p10 = np.zeros_like(p50)
+        p90 = np.zeros_like(p50)
+        for idx, row in df_X.iterrows():
+            store = row['store']
+            dow = row['day_of_week']
+            mask = (historical_sales['store'] == store) & (historical_sales['date'].dt.dayofweek == dow)
+            if not historical_sales[mask].empty:
+                actuals = historical_sales[mask]['revenue']
+                pred = rf_pred[idx] * row['store_dayofweek_avg']
+                residuals = actuals - pred
+                std_resid = residuals.std() if not residuals.empty else 0
+                p10[idx] = p50[idx] - std_resid
+                p90[idx] = p50[idx] + std_resid
+            else:
+                p10[idx] = p50[idx]
+                p90[idx] = p50[idx]
+    else:
+        p10 = p50.copy()
+        p90 = p50.copy()
+    # Enforce non-negativity and ordering
+    p10 = np.maximum(p10, 0)
+    preds = np.vstack([p10, p50, p90])
+    p10, p50, p90 = np.sort(preds, axis=0)
 
     logging.debug(f"Initial p10: {p10}")
     logging.debug(f"Initial p50: {p50}")
     logging.debug(f"Initial p90: {p90}")
 
-    # Ensure p10 < p50 < p90 for all predictions
-    preds = np.vstack([p10, p50, p90])
-    preds_sorted = np.sort(preds, axis=0)
-    p10, p50, p90 = preds_sorted[0], preds_sorted[1], preds_sorted[2]
-    
     # Apply conformal calibration
     calibrator = ConformalCalibrator(alpha=0.1)  # 90% coverage
     
@@ -233,6 +239,20 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     for i, s in enumerate(np.abs(shap_values[0]).argsort()[::-1][:5]):
         print(f"{i+1}: {feature_names['all_features'][s]} -> {shap_values[0][s]:.2f}")
 
+    # SHAP audit: log top 10 features and check for leakage
+    top_10 = list(sorted_importance.items())[:10]
+    logging.info('Top 10 SHAP features:')
+    for feat, val in top_10:
+        logging.info(f'{feat}: {val:.3f}')
+    lag_patterns = ['revenue_lag_', 'revenue_rolling_', 'rolling_', 'lag_']
+    for feat, _ in top_10:
+        if any(pat in feat for pat in lag_patterns):
+            logging.warning(f'Potential leakage: lag/rolling feature in top 10: {feat}')
+    must_have = ['store', 'store_dayofweek_avg', 'discount_pct']
+    for must in must_have:
+        if not any(must in feat for feat, _ in top_10):
+            logging.warning(f'Expected stable feature missing from top 10: {must}')
+
     # --- Calibration: skip if too little data ---
     try:
         historical_data = pd.read_json('models/historical_predictions.json')
@@ -253,6 +273,67 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     except FileNotFoundError:
         logging.warning('Historical predictions not found, skipping calibration')
     
+    # Invert normalization for final revenue prediction
+    pred_revenue = np.expm1(p50) * df_X['store_month_avg']
+    
+    # Ensemble: average store-day and global seasonal model predictions
+    if 'model_global' in models:
+        median_pred_store = np.expm1(models['median'].predict(df_X[feature_names['all_features']]))
+        median_pred_global = np.expm1(models['model_global'].predict(df_X[feature_names['all_features']]))
+        median_pred = 0.5 * median_pred_store + 0.5 * median_pred_global
+        # Use median_pred for p50, and adjust p10/p90 accordingly
+        p50 = median_pred
+        # Optionally, average lower/upper as well if available
+        p10 = np.maximum(p10, 0.5 * p50)
+        p90 = np.minimum(p90, 1.5 * p50)
+
+    # Confidence bands: widen p10/p90 by historical residuals per store-day bucket
+    if historical_sales is not None and 'store' in df_X.columns and 'day_of_week' in df_X.columns:
+        for idx, row in df_X.iterrows():
+            store = row['store']
+            dow = row['day_of_week']
+            mask = (historical_sales['store'] == store) & (historical_sales['date'].dt.dayofweek == dow)
+            if not historical_sales[mask].empty:
+                residuals = historical_sales[mask]['revenue'] - row.get('store_dayofweek_avg', 0)
+                std_resid = residuals.std() if not residuals.empty else 0
+                p10[idx] = p10[idx] - std_resid
+                p90[idx] = p90[idx] + std_resid
+
+    # --- CLIP AND VALIDATE TEST INPUTS ---
+    try:
+        with open('models/brandA_feature_percentiles.json', 'r') as f:
+            percentiles = json.load(f)
+        for col, bounds in percentiles.items():
+            if col in df_X.columns:
+                lower, upper = bounds.get('p1', None), bounds.get('p99', None)
+                if lower is not None and upper is not None:
+                    before = df_X[col].copy()
+                    df_X[col] = df_X[col].clip(lower, upper)
+                    if (before != df_X[col]).any():
+                        warnings.warn(f"Feature '{col}' clipped to [{lower}, {upper}] at prediction time.")
+    except Exception as e:
+        logging.warning(f"Could not load or apply feature percentiles for clipping: {e}")
+    # --- VALIDATE INPUT STORE-DATE PAIR HAS HISTORY ---
+    if historical_sales is not None and 'store' in df_X.columns and 'date' in df_X.columns:
+        for idx, row in df_X.iterrows():
+            store = row['store']
+            date = row['date']
+            hist = historical_sales[(historical_sales['store'] == store) & (historical_sales['date'] < date)]
+            if hist.empty:
+                warnings.warn(f"No historical data for store {store} before {date}. Falling back to store median.")
+                for col in df_X.columns:
+                    if any(pat in col for pat in ['lag', 'rolling', 'revenue_lag_', 'revenue_rolling_']):
+                        df_X.at[idx, col] = historical_sales[historical_sales['store'] == store]['revenue'].median() if not historical_sales[historical_sales['store'] == store].empty else 0
+    # --- LOG SHAP + PREDICTION CONFIDENCE FOR EVERY INFERENCE ---
+    interval_width = p90 - p10
+    for i in range(len(p50)):
+        logging.info(f"Prediction {i}: p10={p10[i]:.2f}, p50={p50[i]:.2f}, p90={p90[i]:.2f}, interval width={interval_width[i]:.2f}")
+        top_shap_idx = np.abs(shap_values[i]).argsort()[::-1][:5]
+        top_shap = [(feature_names['all_features'][j], shap_values[i][j]) for j in top_shap_idx]
+        logging.info(f"Top SHAP features for prediction {i}: {top_shap}")
+        if interval_width[i] > 3 * p50[i]:
+            warnings.warn(f"Prediction interval too wide for prediction {i}: width={interval_width[i]:.2f}, p50={p50[i]:.2f}")
+
     return {
         'p10': p10,
         'p50': p50,

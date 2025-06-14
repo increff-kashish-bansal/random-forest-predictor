@@ -207,6 +207,63 @@ def add_seasonal_volatility_ratio(df, store_col='store', revenue_col='revenue', 
     df['seasonal_volatility_ratio'] = rolling_std / (rolling_mean + 1e-6)
     return df
 
+def align_features(X_pred, feature_names_path='models/brandA_feature_names.json'):
+    """
+    Ensure X_pred has all features expected by the model, adding missing columns as zeros and reordering.
+    Raise error if any required feature is missing or all-NaN after construction.
+    Impute or drop NaN/Inf for critical features.
+    Args:
+        X_pred: DataFrame to align
+        feature_names_path: Path to JSON file with 'all_features' list
+    Returns:
+        DataFrame with all expected features, in correct order and type
+    """
+    import warnings
+    with open(feature_names_path, 'r') as f:
+        feature_names = json.load(f)
+    expected_features = feature_names['all_features']
+    missing = [col for col in expected_features if col not in X_pred.columns]
+    for col in missing:
+        X_pred[col] = 0
+    X_pred = X_pred[expected_features].astype(float)
+    # Check for all-NaN or missing critical features
+    critical_patterns = [
+        'lag', 'rolling', 'cyc', 'interaction', 'revenue_lag_', 'revenue_rolling_', 'discount_pct'
+    ]
+    for col in expected_features:
+        if any(pat in col for pat in critical_patterns):
+            if col not in X_pred.columns or X_pred[col].isnull().all():
+                raise ValueError(f"Critical feature '{col}' is missing or all-NaN at prediction time. Check feature engineering pipeline.")
+    # Impute or drop NaN/Inf for critical features
+    for col in expected_features:
+        if any(pat in col for pat in ['revenue_lag_', 'revenue_rolling_', 'discount_pct']):
+            if col in X_pred.columns:
+                if X_pred[col].isnull().any() or np.isinf(X_pred[col]).any():
+                    # Try to fill with previous period, median, or zero
+                    X_pred[col] = X_pred[col].fillna(method='ffill').fillna(0)
+                    X_pred[col] = X_pred[col].replace([np.inf, -np.inf], 0)
+    return X_pred
+
+def add_same_day_revenue_last_year(df, historical_sales):
+    if historical_sales is None:
+        df['same_day_revenue_last_year'] = np.nan
+        return df
+    df['date'] = pd.to_datetime(df['date'])
+    historical_sales['date'] = pd.to_datetime(historical_sales['date'])
+    lookup = historical_sales.set_index(['store', 'date'])['revenue']
+    def get_last_year(row):
+        try:
+            return lookup.get((row['store'], row['date'] - pd.DateOffset(years=1)), np.nan)
+        except Exception:
+            return np.nan
+    df['same_day_revenue_last_year'] = df.apply(get_last_year, axis=1)
+    store_avg = historical_sales.groupby('store')['revenue'].mean()
+    df['same_day_revenue_last_year'] = df.apply(
+        lambda row: store_avg[row['store']] if pd.isna(row['same_day_revenue_last_year']) else row['same_day_revenue_last_year'],
+        axis=1
+    )
+    return df
+
 def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_sales: pd.DataFrame = None, is_prediction: bool = False) -> Tuple[pd.DataFrame, List[str]]:
     """
     Derive features for model training or prediction.
@@ -224,6 +281,26 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     logging.info(f"Input shapes - Sales: {df_sales.shape}, Stores: {df_stores.shape}")
     if historical_sales is not None:
         logging.info(f"Historical sales shape: {historical_sales.shape}")
+    
+    # Ensure disc_perc exists
+    if 'disc_perc' not in df_sales.columns:
+        if 'disc_value' in df_sales.columns and 'revenue' in df_sales.columns:
+            df_sales['disc_perc'] = df_sales['disc_value'] * 100 / (df_sales['disc_value'] + df_sales['revenue'])
+            df_sales['disc_perc'] = df_sales['disc_perc'].fillna(0).clip(0, 100)
+        else:
+            df_sales['disc_perc'] = 0.0
+    # Ensure discount_pct exists (as decimal 0-1)
+    if 'discount_pct' not in df_sales.columns:
+        df_sales['discount_pct'] = df_sales['disc_perc'] / 100.0
+    # Ensure month and day exist
+    if 'date' in df_sales.columns:
+        df_sales['month'] = pd.to_datetime(df_sales['date']).dt.month
+        df_sales['day'] = pd.to_datetime(df_sales['date']).dt.day
+    else:
+        if 'month' not in df_sales.columns:
+            df_sales['month'] = 1
+        if 'day' not in df_sales.columns:
+            df_sales['day'] = 1
     
     # Calculate sample weights if not in prediction mode
     if not is_prediction and 'revenue' in df_sales.columns:
@@ -892,28 +969,59 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         # During training, calculate lead time from previous day
         df['lead_time_days'] = df.groupby('store')['date'].diff().dt.days
         df['lead_time_days'] = df['lead_time_days'].fillna(0)
-    
     features.append('lead_time_days')
-    
+
+    # Baseline stable features (no lag/rolling)
+    df['store_month_avg'] = df.groupby(['store', 'month'])['revenue'].transform('mean')
+    df['store_day_avg'] = df.groupby(['store', 'day'])['revenue'].transform('mean')
+    df['store_dayofweek_avg'] = df.groupby(['store', 'day_of_week'])['revenue'].transform('mean')
+    features.extend(['store_month_avg', 'store_day_avg', 'store_dayofweek_avg'])
+
+    # Add holiday/event flags from CSV
+    try:
+        festivals_df = pd.read_csv('data/festivals_2015_2030.csv', parse_dates=['date'])
+        festival_dates = festivals_df['date'].dt.normalize().tolist()
+    except Exception as e:
+        logging.warning(f"Could not load festival dates CSV: {e}")
+        festival_dates = []
+    df['is_festival'] = df['date'].isin(festival_dates).astype(int)
+    df['days_to_festival'] = df['date'].apply(lambda d: min([(f - d).days for f in festival_dates if (f - d).days >= 0] or [365]))
+    features.extend(['is_festival', 'days_to_festival'])
+
+    # Revenue percentile rank per store
+    df['revenue_percentile'] = df.groupby('store')['revenue'].rank(pct=True)
+    features.append('revenue_percentile')
+
+    # Weekday-holiday interaction
+    df['is_weekday_festival'] = ((df['is_festival'] == 1) & (df['day_of_week'] < 5)).astype(int)
+    features.append('is_weekday_festival')
+
+    # --- FIX: Always assign X before is_prediction logic ---
+    X = df[features]
+
     if is_prediction:
         try:
             with open('models/brandA_feature_names.json', 'r') as f:
                 saved_features = json.load(f)
         except FileNotFoundError:
             raise ValueError("Feature names file not found. Please train the model first.")
-        # Ensure all required features in 'all_features' are present immediately before feature selection
         all_features = saved_features.get('all_features', [])
-        missing_features = set(all_features) - set(df.columns)
-        if missing_features:
-            print("DEBUG: Missing features before selection:", missing_features)
-            print("DEBUG: DataFrame columns:", list(df.columns))
-            for feat in missing_features:
-                df[feat] = 0  # Add missing features with zeros
-        # Reorder columns to match all_features
-        X = df.reindex(columns=all_features, fill_value=0)
-    else:
-        # During training, use all generated features
-        X = df[features]
+        # Remove lag-based and rolling features from X and features
+        lag_rolling_patterns = [
+            'revenue_lag_', 'revenue_rolling_', 'store_weekday_', 'revenue_week_over_week',
+            'revenue_day_over_day', 'revenue_last_3_days', 'revenue_volatility_3d',
+            'revenue_lag_diff_', 'revenue_lag_7_percentile', 'region_weekday_std',
+            'region_weekday_volatility', 'time_since_last_high_revenue', 'time_since_last_peak_revenue',
+            'demand_trend', 'revenue_median', 'revenue_std', 'store_month_revenue_median',
+            'store_month_revenue_std', 'same_dayofyear_avg_3y', 'same_dayofyear_delta_vs_month',
+            'discount_rolling_mean_14d', 'discount_rolling_std_14d', 'revenue_rolling_mean_90d'
+        ]
+        drop_cols = [col for col in X.columns if any(pat in col for pat in lag_rolling_patterns)]
+        X = X.drop(columns=drop_cols, errors='ignore')
+        features = [f for f in features if not any(pat in f for pat in lag_rolling_patterns)]
+        # Only add missing features that are not in drop_cols
+        filtered_features = [col for col in all_features if col in X.columns]
+        X = X.reindex(columns=filtered_features, fill_value=0)
     
     logging.info(f"Final feature count: {len(features)}")
     logging.info(f"Final feature matrix shape: {X.shape}")
@@ -1042,18 +1150,8 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
         df['revenue_rolling_mean_14d'] = df.apply(lambda row: get_rolling_mean(row, 'revenue', 14), axis=1)
         features.extend(['discount_rolling_mean_14d', 'revenue_rolling_mean_14d'])
     
-    if is_prediction:
-        # Drop/zero out lag-based and rolling features that leak short-term signals
-        lag_rolling_patterns = [
-            'revenue_lag_', 'revenue_rolling_', 'store_weekday_', 'revenue_week_over_week',
-            'revenue_day_over_day', 'revenue_last_3_days', 'revenue_volatility_3d',
-            'revenue_lag_diff_', 'revenue_lag_7_percentile', 'region_weekday_std',
-            'region_weekday_volatility', 'time_since_last_high_revenue', 'time_since_last_peak_revenue',
-            'demand_trend', 'revenue_median', 'revenue_std', 'store_month_revenue_median',
-            'store_month_revenue_std', 'same_dayofyear_avg_3y', 'same_dayofyear_delta_vs_month',
-            'discount_rolling_mean_14d', 'discount_rolling_std_14d', 'revenue_rolling_mean_90d'
-        ]
-        drop_cols = [col for col in X.columns if any(pat in col for pat in lag_rolling_patterns)]
-        X = X.drop(columns=drop_cols, errors='ignore')
+    if historical_sales is not None:
+        df = add_same_day_revenue_last_year(df, historical_sales)
+        features.append('same_day_revenue_last_year')
     
     return X, features
