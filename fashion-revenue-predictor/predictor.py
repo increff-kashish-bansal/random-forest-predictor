@@ -30,6 +30,12 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     with open('models/brandA_feature_names.json', 'r') as f:
         feature_names = json.load(f)
     
+    # Remove 'revenue_percentile' from features if present
+    if 'revenue_percentile' in feature_names['all_features']:
+        feature_names['all_features'].remove('revenue_percentile')
+    if 'revenue_percentile' in df_X.columns:
+        df_X = df_X.drop(columns=['revenue_percentile'])
+    
     # Lock feature set for inference
     df_X = align_features(df_X)
     
@@ -92,14 +98,112 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
         if 'store_month_weekday_avg' not in df_X.columns:
             df_X['store_month_weekday_avg'] = 0
 
+    # --- Ensure all required features are present in X_pred before prediction ---
+    required_features = feature_names['all_features']
+    # Drop any extra columns not in required_features
+    extra_cols = [col for col in df_X.columns if col not in required_features]
+    if extra_cols:
+        df_X = df_X.drop(columns=extra_cols)
+    # Add any missing columns as zeros
+    missing_cols = [col for col in required_features if col not in df_X.columns]
+    if missing_cols:
+        for col in missing_cols:
+            df_X[col] = 0
+    df_X = df_X[required_features]
+
+    # --- Force-inject key business features if missing ---
+    for key_feat in ['store_dayofweek_avg', 'store_month_avg', 'weekday_store_avg']:
+        if key_feat not in df_X.columns:
+            df_X[key_feat] = 0
+
+    # --- Backfill lag/rolling features with store_dayofweek_avg if available ---
+    lag_rolling_cols = [col for col in df_X.columns if ('lag' in col or 'rolling' in col)]
+    if 'store_dayofweek_avg' in df_X.columns:
+        for col in lag_rolling_cols:
+            if df_X[col].isna().any() or (df_X[col] == 0).all():
+                df_X[col] = df_X[col].fillna(df_X['store_dayofweek_avg'])
+                if (df_X[col] == 0).all():
+                    df_X[col] = df_X['store_dayofweek_avg']
+
+    # --- DEBUG: Log X_pred sum, NaNs, columns, and row data ---
+    row_sum = df_X.sum(axis=1)
+    row_nans = df_X.isna().sum(axis=1)
+    print('DEBUG: X_pred sum(axis=1):', row_sum.values)
+    print('DEBUG: X_pred isna().sum(axis=1):', row_nans.values)
+    print('DEBUG: X_pred columns:', list(df_X.columns))
+    print('DEBUG: X_pred row data:', df_X.iloc[0].to_dict())
+
+    # --- Patch revenue_lag_7 if zero or NaN ---
+    if 'revenue_lag_7' in df_X.columns:
+        if np.isnan(df_X['revenue_lag_7'].values[0]) or df_X['revenue_lag_7'].values[0] == 0:
+            if 'store_dayofweek_avg' in df_X.columns:
+                df_X['revenue_lag_7'].values[0] = df_X['store_dayofweek_avg'].values[0]
+
+    # --- Patch and warn if all lag/rolling features are zero ---
+    logger = logging.getLogger("predictor")
+    lag_feats = [col for col in df_X.columns if 'lag' in col or 'rolling' in col]
+    if all(df_X[lag_feats].iloc[0] == 0):
+        logger.warning("All lag/rolling features are zero. Prediction likely to be unreliable.")
+    # Patch zero lag/rolling features (use .at for safe assignment)
+    critical_lag_features = [col for col in lag_feats if col in df_X.columns]
+    global_avg = df_X['store_month_avg'].values[0] if 'store_month_avg' in df_X.columns else 0
+    for col in critical_lag_features:
+        if df_X.at[0, col] == 0.0:
+            fallback_val = df_X.at[0, 'store_dayofweek_avg'] if 'store_dayofweek_avg' in df_X.columns else global_avg
+            df_X.at[0, col] = fallback_val
+
+    # --- Ensure 'store', 'month', 'day_of_week' columns are present for fallback logic ---
+    if 'store' not in df_X.columns and original_input is not None and 'store' in original_input.columns:
+        df_X['store'] = original_input['store'].values
+    if 'month' not in df_X.columns and original_input is not None and 'month' in original_input.columns:
+        df_X['month'] = original_input['month'].values
+    if 'day_of_week' not in df_X.columns and original_input is not None and 'day_of_week' in original_input.columns:
+        df_X['day_of_week'] = original_input['day_of_week'].values
+    # If still missing, raise a clear error
+    for col in ['store', 'month', 'day_of_week']:
+        if col not in df_X.columns:
+            raise KeyError(f"Required column '{col}' missing from features for fallback logic. Check feature engineering and input data.")
+
+    # --- Backfill store_month_avg if zero ---
+    if 'store_month_avg' in df_X.columns and df_X['store_month_avg'].values[0] == 0.0 and historical_sales is not None:
+        store = df_X['store'].values[0]
+        month = df_X['month'].values[0]
+        mask = (historical_sales['store'] == store) & (historical_sales['date'].dt.month == month)
+        fallback = historical_sales[mask]['revenue'].mean() if not historical_sales[mask].empty else 10000
+        df_X['store_month_avg'] = fallback
+    # --- Backfill store_dayofweek_avg if zero ---
+    if 'store_dayofweek_avg' in df_X.columns and df_X['store_dayofweek_avg'].values[0] == 0.0 and historical_sales is not None:
+        store = df_X['store'].values[0]
+        dow = df_X['day_of_week'].values[0]
+        mask = (historical_sales['store'] == store) & (historical_sales['date'].dt.dayofweek == dow)
+        fallback = historical_sales[mask]['revenue'].mean() if not historical_sales[mask].empty else df_X['store_month_avg'].values[0]
+        df_X['store_dayofweek_avg'] = fallback
+    # --- Log a warning if both are still zero ---
+    if ('store_month_avg' in df_X.columns and 'store_dayofweek_avg' in df_X.columns and
+        df_X['store_month_avg'].values[0] == 0.0 and df_X['store_dayofweek_avg'].values[0] == 0.0):
+        logger.warning("Both store_month_avg and store_dayofweek_avg are zero after fallback. Prediction will be fragile.")
+
     # Predict revenue ratio with Random Forest models
     X_pred = df_X[feature_names['all_features']]
+    # --- Refined fallback: Only trigger if input is sparse or NaN-heavy ---
+    input_sum = X_pred.sum(axis=1).item()
+    input_nans = X_pred.isna().sum(axis=1).item()
+    store_dayofweek_avg = df_X['store_dayofweek_avg'].values[0] if 'store_dayofweek_avg' in df_X.columns else 1.0
+    store_month_avg_val = df_X['store_month_avg'].values[0] if 'store_month_avg' in df_X.columns else 0
+    # Model prediction
     rf_pred = models['median'].predict(X_pred)
-    # Invert: pred_revenue = pred_ratio * store_dayofweek_avg
-    store_dayofweek_avg = df_X['store_dayofweek_avg'].values
-    rf_revenue = rf_pred * store_dayofweek_avg
-    # Ensemble with seasonal baseline
-    p50 = 0.5 * rf_revenue + 0.5 * store_dayofweek_avg
+    fallback_triggered = False
+    if (rf_pred is None or np.isnan(rf_pred).any() or np.isinf(rf_pred).any()):
+        logger.warning("Model output is invalid (NaN/Inf). Triggering fallback.")
+        p50 = np.array([store_dayofweek_avg])
+        fallback_triggered = True
+    else:
+        p50 = rf_pred
+        fallback_triggered = False
+    logger.debug(f"rf_pred: {rf_pred}, fallback_triggered: {fallback_triggered}")
+    p10 = p50 * 0.5
+    p90 = p50 * 1.5
+
     # Confidence bands: use historical residual std per store+day_of_week
     if historical_sales is not None and 'store' in df_X.columns and 'day_of_week' in df_X.columns:
         p10 = np.zeros_like(p50)
@@ -146,14 +250,17 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
                     (historical_sales['date'].dt.dayofweek == weekday)
                 ]
                 floor = past['revenue'].mean() * 0.5 if not past.empty else 0
-                p10[idx] = max(p10[idx], floor)
+                p10[idx] = np.maximum(p10[idx], floor)
 
     # --- Fallback if confidence is trash ---
     if 'revenue_std' in df_X.columns:
         if (p90 - p10).mean() > 2 * df_X['revenue_std'].mean():
             logging.warning('Prediction interval too wide, falling back to historical mean.')
             hist_mean = historical_sales['revenue'].mean() if historical_sales is not None else 0
-            p10 = p50 = p90 = np.full_like(p10, hist_mean)
+            p50 = np.full_like(p50, hist_mean)
+            p10 = 0.8 * p50
+            p90 = 1.2 * p50
+            fallback_triggered = True
 
     # --- Weighted ensemble for p50 ---
     if 'store_month_weekday_avg' in df_X.columns:
@@ -273,9 +380,31 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     except FileNotFoundError:
         logging.warning('Historical predictions not found, skipping calibration')
     
-    # Invert normalization for final revenue prediction
-    pred_revenue = np.expm1(p50) * df_X['store_month_avg']
-    
+    prediction_is_log_scaled = not fallback_triggered
+    # --- Invert log1p(revenue / store_month_avg) transformation for all outputs ---
+    store_month_avg = df_X['store_month_avg'].values
+    if fallback_triggered:
+        # Fallback already in revenue scale
+        p10 = 0.8 * p50
+        p90 = 1.2 * p50
+    else:
+        # Clip to prevent overflow in expm1
+        max_log_input = 100  # expm1(100) ≈ 2.688e43
+        p50 = np.clip(p50, a_min=None, a_max=max_log_input)
+        p10 = np.clip(p10, a_min=None, a_max=max_log_input)
+        p90 = np.clip(p90, a_min=None, a_max=max_log_input)
+        # Apply expm1 safely
+        p50 = np.expm1(p50) * store_month_avg
+        p10 = np.expm1(p10) * store_month_avg
+        p90 = np.expm1(p90) * store_month_avg
+    # Clamp values to avoid negative or invalid outputs
+    p10 = np.maximum(p10, 0)
+    p90 = np.maximum(p90, p50)
+
+    # Fix 3: Guarded store_weekday_avg logic
+    if 'store_weekday_avg' in df_X.columns:
+        p10 = np.maximum(p10, 0.5 * np.nan_to_num(df_X['store_weekday_avg'], nan=0))
+
     # Ensemble: average store-day and global seasonal model predictions
     if 'model_global' in models:
         median_pred_store = np.expm1(models['median'].predict(df_X[feature_names['all_features']]))
@@ -305,6 +434,9 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
             percentiles = json.load(f)
         for col, bounds in percentiles.items():
             if col in df_X.columns:
+                # Only clip if not a fallback zero
+                if df_X.at[0, col] == 0.0:
+                    continue
                 lower, upper = bounds.get('p1', None), bounds.get('p99', None)
                 if lower is not None and upper is not None:
                     before = df_X[col].copy()
