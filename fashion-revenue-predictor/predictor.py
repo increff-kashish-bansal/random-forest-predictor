@@ -331,19 +331,17 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
             logger.warning(f"Could not apply log1p-inverse and scaling to rf_pred: {e}")
     fallback_triggered = False
     
-    if (rf_pred is None or np.isnan(rf_pred).any() or np.isinf(rf_pred).any() or 
+    if (np.isnan(rf_pred).any() or
         (input_nans > len(feature_names['all_features']) * 0.5) or  # More than 50% features are NaN
         (input_sum == 0) or (rf_pred[0] == 0)):
         logger.warning("Model output is invalid or input data is too sparse or zero. Triggering custom fallback.")
         p50 = np.array([custom_fallback_value])
         fallback_triggered = True
+    elif abs(rf_pred[0] - fallback_value) > fallback_value * 2:  # If prediction differs by more than 2x
+        p50 = np.array([0.7 * fallback_value + 0.3 * rf_pred[0]])  # Weighted average favoring fallback
+        logger.info("Using weighted average of model prediction and fallback value")
     else:
-        # If prediction is too low or high compared to fallback, use weighted average
-        if abs(rf_pred[0] - fallback_value) > fallback_value * 2:  # If prediction differs by more than 2x
-            p50 = np.array([0.7 * fallback_value + 0.3 * rf_pred[0]])  # Weighted average favoring fallback
-            logger.info("Using weighted average of model prediction and fallback value")
-        else:
-            p50 = rf_pred
+        p50 = rf_pred
     logger.debug(f"rf_pred: {rf_pred}, fallback_triggered: {fallback_triggered}")
     p10 = p50 * 0.5
     p90 = p50 * 1.5
@@ -440,14 +438,14 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     else:
         # Calculate SHAP values using median model with improved settings
         explainer = shap.TreeExplainer(models['median'], feature_perturbation="interventional")
-        shap_values = explainer.shap_values(df_X[feature_names['all_features']])
-        # Get feature importance scores
-        feature_importance = np.abs(shap_values).mean(axis=0)
-        feature_importance = dict(zip(feature_names['all_features'], feature_importance))
-        sorted_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
-        # Get top 5 features
-        top_5_features = list(sorted_importance.items())[:5]
-
+    shap_values = explainer.shap_values(df_X[feature_names['all_features']])
+    # Get feature importance scores
+    feature_importance = np.abs(shap_values).mean(axis=0)
+    feature_importance = dict(zip(feature_names['all_features'], feature_importance))
+    sorted_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
+    # Get top 5 features
+    top_5_features = list(sorted_importance.items())[:5]
+    
     # After all calibration and sorting, invert log1p transformation for all predictions
     print("DEBUG: Final predictions (p10, p50, p90):", p10, p50, p90)
     
@@ -597,7 +595,7 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     if 'city_encoded' in df_X.columns and 'revenue_last_3_days' in df_X.columns:
         fallback = 0.5 * df_X['revenue_last_3_days'] + 0.5 * df_X['city_encoded']
         p50 = np.where(shap_sum < 0.05, fallback, p50)
-    
+
     # --- Store-based fallback for p50 ---
     if historical_sales is not None and not historical_sales.empty:
         # Find min historical revenue for this store, weekday, and month
