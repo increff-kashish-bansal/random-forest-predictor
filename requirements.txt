@@ -1,9 +1,18 @@
 streamlit
-pandas
-numpy
-scikit-learn
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
 shap
 matplotlib
 scipy
+# For macOS users: required for LightGBM parallelism
+# If using macOS, install libomp via Homebrew: brew install libomp
 lightgbm
-statsmodels>=0.14.0 
+statsmodels>=0.14.0
+joblib>=1.3.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+boto3>=1.34.0
+botocore>=1.34.0
+plotly>=5.0.0
+optuna>=3.0.0 

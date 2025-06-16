@@ -337,6 +337,15 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     
     # Model prediction with enhanced fallback
     rf_pred = models['median'].predict(X_pred)
+    # Compute SHAP values for the median model
+    explainer = shap.TreeExplainer(models['median'])
+    shap_values = explainer.shap_values(X_pred)
+    # Get top 5 features by mean absolute SHAP value
+    shap_importance = np.abs(shap_values).mean(axis=0)
+    top_5_idx = np.argsort(shap_importance)[::-1][:5]
+    top_5_features = [feature_names['all_features'][i] for i in top_5_idx]
+    # Define sorted_importance for SHAP audit
+    sorted_importance = dict(sorted(zip(feature_names['all_features'], shap_importance), key=lambda x: x[1], reverse=True))
     # If model was trained on log1p of revenue ratio, invert transform and multiply by denominator
     if hasattr(models['median'], 'feature_names_in_'):
         try:
@@ -354,6 +363,8 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
             rf_pred = revenue_pred
         except Exception as e:
             logger.warning(f"Could not apply log1p-inverse and scaling to rf_pred: {e}")
+            # If transformation fails, use the raw prediction
+            rf_pred = np.exp(rf_pred)  # Simple exponential transformation as fallback
     fallback_triggered = False
     
     if (rf_pred is None or np.isnan(rf_pred).any() or np.isinf(rf_pred).any() or 
@@ -365,11 +376,18 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     else:
         # If prediction is too low or high compared to fallback, use weighted average
         if abs(rf_pred[0] - fallback_value) > fallback_value * 2:  # If prediction differs by more than 2x
-            p50 = np.array([0.7 * fallback_value + 0.3 * rf_pred[0]])  # Weighted average favoring fallback
+            p50 = np.array([0.5 * fallback_value + 0.5 * rf_pred[0]])  # Equal weight to model and fallback
             logger.info("Using weighted average of model prediction and fallback value")
         else:
             p50 = rf_pred
     logger.debug(f"rf_pred: {rf_pred}, fallback_triggered: {fallback_triggered}")
+    
+    # Ensure p50 is not too small
+    if p50[0] < 1000:  # If prediction is less than 1000
+        logger.warning(f"P50 prediction too low ({p50[0]}), using fallback value")
+        p50 = np.array([fallback_value])
+        fallback_triggered = True
+    
     p10 = p50 * 0.5
     p90 = p50 * 1.5
 
@@ -418,12 +436,12 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
                     (historical_sales['date'].dt.month == month) &
                     (historical_sales['date'].dt.dayofweek == weekday)
                 ]
-                floor = past['revenue'].mean() * 0.5 if not past.empty else 0
+                floor = past['revenue'].mean() * 0.7 if not past.empty else 0  # Increased from 0.5 to 0.7
                 p10[idx] = np.maximum(p10[idx], floor)
 
     # --- Fallback if confidence is trash ---
     if 'revenue_std' in df_X.columns:
-        if (p90 - p10).mean() > 2 * df_X['revenue_std'].mean():
+        if (p90 - p10).mean() > 3 * df_X['revenue_std'].mean():  # Increased threshold from 2x to 3x
             logging.warning('Prediction interval too wide, falling back to historical mean.')
             hist_mean = historical_sales['revenue'].mean() if historical_sales is not None else 0
             p50 = np.full_like(p50, hist_mean)
@@ -436,7 +454,7 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
         if df_X['store_month_weekday_avg'].isna().all():
             logging.warning('store_month_weekday_avg is all NaN, skipping ensemble adjustment.')
         else:
-            p50 = 0.7 * p50 + 0.3 * df_X['store_month_weekday_avg'].fillna(0)
+            p50 = 0.5 * p50 + 0.5 * df_X['store_month_weekday_avg'].fillna(0)  # Equal weight instead of 0.7/0.3
     if np.isnan(p50).any():
         logging.warning('p50 is NaN after ensemble adjustment, setting to p10 or 0.')
         p50 = np.nan_to_num(p50, nan=p10, posinf=p10, neginf=p10)
@@ -444,43 +462,15 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     # --- Wide interval/low-confidence prediction check ---
     interval_width = p90 - p10
     for i in range(len(p50)):
-        if p50[i] < 1e-3 or interval_width[i] > 10 * max(p50[i], 1):
+        if p50[i] < 1e-3 or interval_width[i] > 15 * max(p50[i], 1):  # Increased threshold from 10x to 15x
             logger.warning(f"Prediction interval too wide: width={interval_width[i]:.2f}, p50={p50[i]:.2f}")
             p10[i], p50[i], p90[i] = np.nan, np.nan, np.nan
 
-    # --- Fallback-dominated SHAP skip logic ---
-    # Count how many features were backfilled (i.e., set to fallback value)
-    backfilled_count = 0
-    fallback_cols = []
-    for col in df_X.columns:
-        if col in ['store_month_avg', 'store_dayofweek_avg'] or ('lag' in col or 'rolling' in col):
-            if np.all(df_X[col] == df_X[col][0]):
-                backfilled_count += 1
-                fallback_cols.append(col)
-    skip_shap = backfilled_count > 30 or X_pred.isna().sum().sum() > 0
-    if skip_shap:
-        logger.warning(f"Skipping SHAP calculation: backfilled_count={backfilled_count}, fallback_cols={fallback_cols}, any NaN in X_pred={X_pred.isna().sum().sum() > 0}")
-        shap_values = np.full_like(X_pred, np.nan, dtype=np.float64)
-        top_5_features = []
-    else:
-        # Calculate SHAP values using median model with improved settings
-        explainer = shap.TreeExplainer(models['median'], feature_perturbation="interventional")
-    shap_values = explainer.shap_values(df_X[feature_names['all_features']])
-    # Get feature importance scores
-    feature_importance = np.abs(shap_values).mean(axis=0)
-    feature_importance = dict(zip(feature_names['all_features'], feature_importance))
-    sorted_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
-    # Get top 5 features
-    top_5_features = list(sorted_importance.items())[:5]
-    
-    # After all calibration and sorting, invert log1p transformation for all predictions
-    print("DEBUG: Final predictions (p10, p50, p90):", p10, p50, p90)
-    
     # --- Post-processing rules for prediction intervals ---
     if 'store_weekday_avg' in df_X.columns:
-        p10 = np.maximum(p10, 0.5 * df_X['store_weekday_avg'])
+        p10 = np.maximum(p10, 0.7 * df_X['store_weekday_avg'])  # Increased from 0.5 to 0.7
     if 'revenue_rolling_mean_3d' in df_X.columns:
-        p50 = 0.8 * p50 + 0.2 * df_X['revenue_rolling_mean_3d']
+        p50 = 0.5 * p50 + 0.5 * df_X['revenue_rolling_mean_3d']  # Equal weight instead of 0.8/0.2
     if 'revenue_volatility_3d' in df_X.columns:
         vol = df_X['revenue_volatility_3d'].fillna(0)
         p10 = np.where(vol > 0.4, p50 - 1.2 * (p50 - p10), p10)
@@ -488,17 +478,17 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     preds = np.vstack([p10, p50, p90])
     p10, p50, p90 = np.sort(preds, axis=0)
     if 'store_seasonal_index' in df_X.columns:
-        upper_clip = df_X['store_seasonal_index'] * 1.5 * p50
+        upper_clip = df_X['store_seasonal_index'] * 2.0 * p50  # Increased from 1.5x to 2.0x
         p90 = np.minimum(p90, upper_clip)
     shap_sum = np.abs(shap_values).sum(axis=1)
     if 'revenue_rolling_mean_7d' in df_X.columns:
-        p50 = np.where(shap_sum < 0.1, df_X['revenue_rolling_mean_7d'], p50)
+        p50 = np.where(shap_sum < 0.05, df_X['revenue_rolling_mean_7d'], p50)  # Reduced threshold from 0.1 to 0.05
     if 'store_month_revenue_median' in df_X.columns and 'store_month_revenue_std' in df_X.columns:
-        upper_bound = df_X['store_month_revenue_median'] + 1.5 * df_X['store_month_revenue_std']
+        upper_bound = df_X['store_month_revenue_median'] + 2.0 * df_X['store_month_revenue_std']  # Increased from 1.5x to 2.0x
         p90 = np.minimum(p90, upper_bound)
     if all([f'revenue_lag_{lag}' in df_X.columns for lag in [7, 14, 30]]):
         rolling_avg = (df_X['revenue_lag_7'] + df_X['revenue_lag_14'] + df_X['revenue_lag_30']) / 3
-        p50 = 0.75 * p50 + 0.25 * rolling_avg
+        p50 = 0.5 * p50 + 0.5 * rolling_avg  # Equal weight instead of 0.75/0.25
     if 'premium_location_discount' in df_X.columns:
         boost = 0.1 * df_X['premium_location_discount']
         p90 += boost
@@ -595,9 +585,9 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
 
     # --- Post-processing rules for prediction intervals ---
     if 'store_weekday_avg' in df_X.columns:
-        p10 = np.maximum(p10, 0.5 * df_X['store_weekday_avg'])
+        p10 = np.maximum(p10, 0.7 * df_X['store_weekday_avg'])  # Increased from 0.5 to 0.7
     if 'revenue_rolling_mean_3d' in df_X.columns:
-        p50 = 0.8 * p50 + 0.2 * df_X['revenue_rolling_mean_3d']
+        p50 = 0.5 * p50 + 0.5 * df_X['revenue_rolling_mean_3d']  # Equal weight instead of 0.8/0.2
     if 'revenue_volatility_3d' in df_X.columns:
         vol = df_X['revenue_volatility_3d'].fillna(0)
         p10 = np.where(vol > 0.4, p50 - 1.2 * (p50 - p10), p10)
@@ -605,17 +595,17 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     preds = np.vstack([p10, p50, p90])
     p10, p50, p90 = np.sort(preds, axis=0)
     if 'store_seasonal_index' in df_X.columns:
-        upper_clip = df_X['store_seasonal_index'] * 1.5 * p50
+        upper_clip = df_X['store_seasonal_index'] * 2.0 * p50  # Increased from 1.5x to 2.0x
         p90 = np.minimum(p90, upper_clip)
     shap_sum = np.abs(shap_values).sum(axis=1)
     if 'revenue_rolling_mean_7d' in df_X.columns:
-        p50 = np.where(shap_sum < 0.1, df_X['revenue_rolling_mean_7d'], p50)
+        p50 = np.where(shap_sum < 0.05, df_X['revenue_rolling_mean_7d'], p50)  # Reduced threshold from 0.1 to 0.05
     if 'store_month_revenue_median' in df_X.columns and 'store_month_revenue_std' in df_X.columns:
-        upper_bound = df_X['store_month_revenue_median'] + 1.5 * df_X['store_month_revenue_std']
+        upper_bound = df_X['store_month_revenue_median'] + 2.0 * df_X['store_month_revenue_std']  # Increased from 1.5x to 2.0x
         p90 = np.minimum(p90, upper_bound)
     if all([f'revenue_lag_{lag}' in df_X.columns for lag in [7, 14, 30]]):
         rolling_avg = (df_X['revenue_lag_7'] + df_X['revenue_lag_14'] + df_X['revenue_lag_30']) / 3
-        p50 = 0.75 * p50 + 0.25 * rolling_avg
+        p50 = 0.5 * p50 + 0.5 * rolling_avg  # Equal weight instead of 0.75/0.25
     if 'premium_location_discount' in df_X.columns:
         boost = 0.1 * df_X['premium_location_discount']
         p90 += boost
