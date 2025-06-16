@@ -387,18 +387,18 @@ def train_model(df_sales, df_stores):
         try:
             # Check if column is numeric
             if pd.api.types.is_numeric_dtype(X_selected[col]):
-        col_stats = X_selected[col].describe()
-        logging.info(f"\nStatistics for {col}:")
+                col_stats = X_selected[col].describe()
+                logging.info(f"\nStatistics for {col}:")
                 if 'mean' in col_stats:
-        logging.info(f"- Mean: {col_stats['mean']:.6f}")
+                    logging.info(f"- Mean: {col_stats['mean']:.6f}")
                 if 'std' in col_stats:
-        logging.info(f"- Std: {col_stats['std']:.6f}")
+                    logging.info(f"- Std: {col_stats['std']:.6f}")
                 if 'min' in col_stats:
-        logging.info(f"- Min: {col_stats['min']:.6f}")
+                    logging.info(f"- Min: {col_stats['min']:.6f}")
                 if 'max' in col_stats:
-        logging.info(f"- Max: {col_stats['max']:.6f}")
-        logging.info(f"- Non-zero count: {(X_selected[col] != 0).sum()}")
-        logging.info(f"- Zero count: {(X_selected[col] == 0).sum()}")
+                    logging.info(f"- Max: {col_stats['max']:.6f}")
+                logging.info(f"- Non-zero count: {(X_selected[col] != 0).sum()}")
+                logging.info(f"- Zero count: {(X_selected[col] == 0).sum()}")
             else:
                 logging.info(f"\nStatistics for {col} (non-numeric):")
                 logging.info(f"- Unique values: {X_selected[col].nunique()}")
