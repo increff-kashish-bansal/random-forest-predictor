@@ -253,9 +253,17 @@ def train_model(df_sales, df_stores):
     y = y.iloc[sort_idx]
     store_ids = df_sales['store'].values[sort_idx]
     
+    # --- Log-transform target for stability ---
+    y_log = np.log1p(y)
+
     # Calculate sample weights
     sample_weights = calculate_sample_weights(df_sales.iloc[sort_idx])
     logging.info("Sample weights calculated with log-based decay and day-of-week weighting")
+    # --- Recent data boost ---
+    cutoff_date = df_sales['date'].max() - pd.Timedelta(days=90)
+    recent_mask = (df_sales.iloc[sort_idx]['date'] > cutoff_date)
+    sample_weights[recent_mask] *= 1.5
+    sample_weights = sample_weights / sample_weights.sum()  # Renormalize
 
     # Instantiate Random Forest models for median, lower, and upper quantiles
     rf_median = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
@@ -266,18 +274,20 @@ def train_model(df_sales, df_stores):
     selected_features = X.columns.tolist()
     X_selected = X[selected_features]
 
-    # Fit rf_median before feature selection
-    rf_median.fit(X_selected, y)
+    # Fit rf_median before feature selection (log target)
+    rf_median.fit(X_selected, y_log, sample_weight=sample_weights)
 
-    # Drop low-importance features, but always keep key business features
+    # --- Permutation importance filter ---
+    perm_result = permutation_importance(rf_median, X_selected, y_log, n_repeats=5, random_state=42, n_jobs=-1)
+    importances = perm_result.importances_mean
+    keep_mask = importances > 0.001
+    X_selected = X_selected.loc[:, keep_mask]
+    selected_features = X_selected.columns.tolist()
+    logging.info(f"Features kept after permutation importance: {selected_features}")
+
+    # --- Drop low-importance features, but always keep key business features
     key_features = ['revenue_lag_7', 'revenue_rolling_mean_7d', 'discount_pct', 'weekday_store_avg']
     X_selected, selected_features = drop_low_importance_features(rf_median, X_selected, threshold=0.001, keep_features=key_features)
-
-    # --- Remove leaky feature if present ---
-    if 'revenue_percentile' in X_selected.columns:
-        X_selected = X_selected.drop(columns=['revenue_percentile'])
-        if 'revenue_percentile' in selected_features:
-            selected_features.remove('revenue_percentile')
 
     # --- (3) Ensure volatility features are included in lower/upper model features ---
     volatility_features = [
@@ -343,15 +353,22 @@ def train_model(df_sales, df_stores):
 
     # Re-split after feature selection
     X_train, X_test, y_train, y_test = train_test_split(
-        X_selected, y, test_size=0.2, random_state=42
+        X_selected, y_log, test_size=0.2, random_state=42
     )
 
-    # Retrain models on reduced feature set
-    rf_median.fit(X_train, y_train)
+    # Retrain models on reduced feature set (log target)
+    rf_median.fit(X_train, y_train, sample_weight=sample_weights[:len(X_train)])
     median_pred_train = rf_median.predict(X_train)
     median_pred_test = rf_median.predict(X_test)
     residuals_train = y_train - median_pred_train
     residuals_test = y_test - median_pred_test
+
+    # --- Save model metadata for correct scaling ---
+    train_pred_mean = float(np.mean(median_pred_train))
+    target_mean = float(np.mean(np.expm1(y_train)))
+    with open('models/brandA_model_metadata.json', 'w') as f:
+        json.dump({'train_pred_mean': train_pred_mean, 'target_mean': target_mean}, f)
+    logging.info("Saved model metadata to models/brandA_model_metadata.json")
 
     # --- (4) Smooth residuals using rolling median (window=7) ---
     def smooth_residuals(residuals, window=7):

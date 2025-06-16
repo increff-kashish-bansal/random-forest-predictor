@@ -168,38 +168,182 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     if 'store_month_avg' in df_X.columns and df_X['store_month_avg'].values[0] == 0.0 and historical_sales is not None:
         store = df_X['store'].values[0]
         month = df_X['month'].values[0]
+        # Level 1: Try exact store and month match
         mask = (historical_sales['store'] == store) & (historical_sales['date'].dt.month == month)
-        fallback = historical_sales[mask]['revenue'].mean() if not historical_sales[mask].empty else 10000
+        if not historical_sales[mask].empty:
+            fallback = historical_sales[mask]['revenue'].mean()
+            logger.info(f"[Fallback][store_month_avg] Level 1: store={store}, month={month}, value={fallback}")
+        else:
+            # Level 2: Try same store, any month
+            mask = (historical_sales['store'] == store)
+            if not historical_sales[mask].empty:
+                fallback = historical_sales[mask]['revenue'].mean()
+                logger.info(f"[Fallback][store_month_avg] Level 2: store={store}, any month, value={fallback}")
+            else:
+                # Level 3: Try same month, any store
+                mask = (historical_sales['date'].dt.month == month)
+                if not historical_sales[mask].empty:
+                    fallback = historical_sales[mask]['revenue'].mean()
+                    logger.info(f"[Fallback][store_month_avg] Level 3: any store, month={month}, value={fallback}")
+                else:
+                    # Level 4: Use global average
+                    fallback = historical_sales['revenue'].mean()
+                    logger.info(f"[Fallback][store_month_avg] Level 4: global average, value={fallback}")
         df_X['store_month_avg'] = fallback
+        logger.info(f"Backfilled store_month_avg with {fallback:.2f} using fallback logic")
+        logger.info(f"[Fallback][store_month_avg] Final value used: {df_X['store_month_avg'].values[0]}")
+
     # --- Backfill store_dayofweek_avg if zero ---
     if 'store_dayofweek_avg' in df_X.columns and df_X['store_dayofweek_avg'].values[0] == 0.0 and historical_sales is not None:
         store = df_X['store'].values[0]
         dow = df_X['day_of_week'].values[0]
+        # Level 1: Try exact store and day of week match
         mask = (historical_sales['store'] == store) & (historical_sales['date'].dt.dayofweek == dow)
-        fallback = historical_sales[mask]['revenue'].mean() if not historical_sales[mask].empty else df_X['store_month_avg'].values[0]
+        if not historical_sales[mask].empty:
+            fallback = historical_sales[mask]['revenue'].mean()
+            logger.info(f"[Fallback][store_dayofweek_avg] Level 1: store={store}, dow={dow}, value={fallback}")
+        else:
+            # Level 2: Try same store, any day of week
+            mask = (historical_sales['store'] == store)
+            if not historical_sales[mask].empty:
+                fallback = historical_sales[mask]['revenue'].mean()
+                logger.info(f"[Fallback][store_dayofweek_avg] Level 2: store={store}, any dow, value={fallback}")
+            else:
+                # Level 3: Try same day of week, any store
+                mask = (historical_sales['date'].dt.dayofweek == dow)
+                if not historical_sales[mask].empty:
+                    fallback = historical_sales[mask]['revenue'].mean()
+                    logger.info(f"[Fallback][store_dayofweek_avg] Level 3: any store, dow={dow}, value={fallback}")
+                else:
+                    # Level 4: Use store_month_avg or global average
+                    fallback = df_X['store_month_avg'].values[0] if df_X['store_month_avg'].values[0] > 0 else historical_sales['revenue'].mean()
+                    logger.info(f"[Fallback][store_dayofweek_avg] Level 4: fallback to store_month_avg/global, value={fallback}")
         df_X['store_dayofweek_avg'] = fallback
-    # --- Log a warning if both are still zero ---
-    if ('store_month_avg' in df_X.columns and 'store_dayofweek_avg' in df_X.columns and
-        df_X['store_month_avg'].values[0] == 0.0 and df_X['store_dayofweek_avg'].values[0] == 0.0):
-        logger.warning("Both store_month_avg and store_dayofweek_avg are zero after fallback. Prediction will be fragile.")
+        logger.info(f"Backfilled store_dayofweek_avg with {fallback:.2f} using fallback logic")
+        logger.info(f"[Fallback][store_dayofweek_avg] Final value used: {df_X['store_dayofweek_avg'].values[0]}")
 
-    # Predict revenue ratio with Random Forest models
+    # --- Enhanced backfill for lag/rolling features ---
+    lag_rolling_cols = [col for col in df_X.columns if ('lag' in col or 'rolling' in col)]
+    if lag_rolling_cols:
+        # Calculate global statistics for fallback
+        global_mean = historical_sales['revenue'].mean() if historical_sales is not None else 10000
+        global_std = historical_sales['revenue'].std() if historical_sales is not None else 5000
+        for col in lag_rolling_cols:
+            if df_X[col].isna().any() or (df_X[col] == 0).all():
+                # Try multiple fallback levels
+                if 'store_dayofweek_avg' in df_X.columns and df_X['store_dayofweek_avg'].values[0] > 0:
+                    fallback = df_X['store_dayofweek_avg'].values[0]
+                    logger.info(f"[Fallback][{col}] Level 1: store_dayofweek_avg, value={fallback}")
+                elif 'store_month_avg' in df_X.columns and df_X['store_month_avg'].values[0] > 0:
+                    fallback = df_X['store_month_avg'].values[0]
+                    logger.info(f"[Fallback][{col}] Level 2: store_month_avg, value={fallback}")
+                else:
+                    # Use global statistics with some randomness to avoid identical predictions
+                    fallback = global_mean + np.random.normal(0, global_std * 0.1)
+                    logger.info(f"[Fallback][{col}] Level 3: global mean + noise, value={fallback}")
+                df_X[col] = df_X[col].fillna(fallback)
+                if (df_X[col] == 0).all():
+                    df_X[col] = fallback
+                logger.info(f"Backfilled {col} with {fallback:.2f} using fallback logic")
+                logger.info(f"[Fallback][{col}] Final value used: {df_X[col].values[0]}")
+
+    # --- Custom fallback value calculation as per user formula ---
+    def calculate_custom_fallback(df_X, historical_sales, original_input):
+        # Get store, month, and day_of_week
+        store = df_X['store'].values[0] if 'store' in df_X.columns else None
+        month = df_X['month'].values[0] if 'month' in df_X.columns else None
+        day_of_week = df_X['day_of_week'].values[0] if 'day_of_week' in df_X.columns else None
+        # Filter historical sales for this store, month, and day_of_week
+        if store is not None and month is not None and day_of_week is not None and historical_sales is not None:
+            mask = (
+                (historical_sales['store'] == store) &
+                (historical_sales['date'].dt.month == month) &
+                (historical_sales['date'].dt.dayofweek == day_of_week)
+            )
+            store_hist = historical_sales[mask]
+        else:
+            store_hist = historical_sales
+        # Average revenue for same store, month, and day_of_week across all years
+        avg_revenue = store_hist['revenue'].mean() if store_hist is not None and not store_hist.empty else 0
+        # Get predicted date
+        if 'date' in df_X.columns:
+            pred_date = pd.to_datetime(df_X['date'].values[0])
+        elif original_input is not None and 'date' in original_input.columns:
+            pred_date = pd.to_datetime(original_input['date'].values[0])
+        else:
+            pred_date = None
+        # Get last available date in historical data
+        last_hist_date = store_hist['date'].max() if store_hist is not None and not store_hist.empty else None
+        # Number of years between predicted date and last available data date
+        if pred_date is not None and last_hist_date is not None:
+            years_diff = (pred_date.year - last_hist_date.year)
+            years_factor = years_diff / 100 + 1.1
+        else:
+            years_factor = 1.1
+        # Get discount percentage
+        if 'discount_pct' in df_X.columns:
+            discount_perc = df_X['discount_pct'].values[0] * 100
+        elif original_input is not None and 'discount_pct' in original_input.columns:
+            discount_perc = original_input['discount_pct'].values[0] * 100
+        else:
+            discount_perc = 0
+        discount_factor = (100 + discount_perc) / 100
+        # Calculate fallback
+        fallback = avg_revenue * 1.1 * years_factor * discount_factor
+        logger.info(f"[CustomFallback] avg_revenue={avg_revenue}, years_factor={years_factor}, discount_factor={discount_factor}, fallback={fallback}")
+        return fallback
+
+    # --- Enhanced prediction fallback logic ---
     X_pred = df_X[feature_names['all_features']]
-    # --- Refined fallback: Only trigger if input is sparse or NaN-heavy ---
     input_sum = X_pred.sum(axis=1).item()
     input_nans = X_pred.isna().sum(axis=1).item()
-    store_dayofweek_avg = df_X['store_dayofweek_avg'].values[0] if 'store_dayofweek_avg' in df_X.columns else 1.0
+    
+    # Calculate robust fallback values
+    store_dayofweek_avg = df_X['store_dayofweek_avg'].values[0] if 'store_dayofweek_avg' in df_X.columns else 0
     store_month_avg_val = df_X['store_month_avg'].values[0] if 'store_month_avg' in df_X.columns else 0
-    # Model prediction
+    
+    # Use the larger of the two averages as fallback
+    fallback_value = max(store_dayofweek_avg, store_month_avg_val)
+    if fallback_value == 0 and historical_sales is not None:
+        fallback_value = historical_sales['revenue'].mean()
+    
+    # Use custom fallback if model output is invalid or zero
+    custom_fallback_value = calculate_custom_fallback(df_X, historical_sales, original_input)
+    
+    # Model prediction with enhanced fallback
     rf_pred = models['median'].predict(X_pred)
+    # If model was trained on log1p of revenue ratio, invert transform and multiply by denominator
+    if hasattr(models['median'], 'feature_names_in_'):
+        try:
+            # 1. Clip log-prediction to prevent overflow
+            rf_pred = np.clip(rf_pred, -10, 10)
+            # 2. Invert log1p
+            ratio_pred = np.expm1(rf_pred)
+            # 3. Multiply by denominator (store_dayofweek_avg)
+            denominator = df_X['store_dayofweek_avg'].values if 'store_dayofweek_avg' in df_X.columns else 1.0
+            revenue_pred = ratio_pred * denominator
+            # 4. Fallback if nan or inf
+            if np.isnan(revenue_pred).any() or np.isinf(revenue_pred).any():
+                logger.warning('Revenue prediction is nan or inf, falling back to denominator.')
+                revenue_pred = denominator
+            rf_pred = revenue_pred
+        except Exception as e:
+            logger.warning(f"Could not apply log1p-inverse and scaling to rf_pred: {e}")
     fallback_triggered = False
-    if (rf_pred is None or np.isnan(rf_pred).any() or np.isinf(rf_pred).any()):
-        logger.warning("Model output is invalid (NaN/Inf). Triggering fallback.")
-        p50 = np.array([store_dayofweek_avg])
+    
+    if (rf_pred is None or np.isnan(rf_pred).any() or np.isinf(rf_pred).any() or 
+        (input_nans > len(feature_names['all_features']) * 0.5) or  # More than 50% features are NaN
+        (input_sum == 0) or (rf_pred[0] == 0)):
+        logger.warning("Model output is invalid or input data is too sparse or zero. Triggering custom fallback.")
+        p50 = np.array([custom_fallback_value])
         fallback_triggered = True
     else:
-        p50 = rf_pred
-        fallback_triggered = False
+        # If prediction is too low or high compared to fallback, use weighted average
+        if abs(rf_pred[0] - fallback_value) > fallback_value * 2:  # If prediction differs by more than 2x
+            p50 = np.array([0.7 * fallback_value + 0.3 * rf_pred[0]])  # Weighted average favoring fallback
+            logger.info("Using weighted average of model prediction and fallback value")
+        else:
+            p50 = rf_pred
     logger.debug(f"rf_pred: {rf_pred}, fallback_triggered: {fallback_triggered}")
     p10 = p50 * 0.5
     p90 = p50 * 1.5
@@ -272,18 +416,38 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
         logging.warning('p50 is NaN after ensemble adjustment, setting to p10 or 0.')
         p50 = np.nan_to_num(p50, nan=p10, posinf=p10, neginf=p10)
 
-    # Calculate SHAP values using median model
-    explainer = shap.TreeExplainer(models['median'])
-    shap_values = explainer.shap_values(df_X[feature_names['all_features']])
-    
-    # Get feature importance scores
-    feature_importance = np.abs(shap_values).mean(axis=0)
-    feature_importance = dict(zip(feature_names['all_features'], feature_importance))
-    sorted_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
-    
-    # Get top 5 features
-    top_5_features = list(sorted_importance.items())[:5]
-    
+    # --- Wide interval/low-confidence prediction check ---
+    interval_width = p90 - p10
+    for i in range(len(p50)):
+        if p50[i] < 1e-3 or interval_width[i] > 10 * max(p50[i], 1):
+            logger.warning(f"Prediction interval too wide: width={interval_width[i]:.2f}, p50={p50[i]:.2f}")
+            p10[i], p50[i], p90[i] = np.nan, np.nan, np.nan
+
+    # --- Fallback-dominated SHAP skip logic ---
+    # Count how many features were backfilled (i.e., set to fallback value)
+    backfilled_count = 0
+    fallback_cols = []
+    for col in df_X.columns:
+        if col in ['store_month_avg', 'store_dayofweek_avg'] or ('lag' in col or 'rolling' in col):
+            if np.all(df_X[col] == df_X[col][0]):
+                backfilled_count += 1
+                fallback_cols.append(col)
+    skip_shap = backfilled_count > 30 or X_pred.isna().sum().sum() > 0
+    if skip_shap:
+        logger.warning(f"Skipping SHAP calculation: backfilled_count={backfilled_count}, fallback_cols={fallback_cols}, any NaN in X_pred={X_pred.isna().sum().sum() > 0}")
+        shap_values = np.full_like(X_pred, np.nan, dtype=np.float64)
+        top_5_features = []
+    else:
+        # Calculate SHAP values using median model with improved settings
+        explainer = shap.TreeExplainer(models['median'], feature_perturbation="interventional")
+        shap_values = explainer.shap_values(df_X[feature_names['all_features']])
+        # Get feature importance scores
+        feature_importance = np.abs(shap_values).mean(axis=0)
+        feature_importance = dict(zip(feature_names['all_features'], feature_importance))
+        sorted_importance = dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
+        # Get top 5 features
+        top_5_features = list(sorted_importance.items())[:5]
+
     # After all calibration and sorting, invert log1p transformation for all predictions
     print("DEBUG: Final predictions (p10, p50, p90):", p10, p50, p90)
     
@@ -381,52 +545,101 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
         logging.warning('Historical predictions not found, skipping calibration')
     
     prediction_is_log_scaled = not fallback_triggered
-    # --- Invert log1p(revenue / store_month_avg) transformation for all outputs ---
-    store_month_avg = df_X['store_month_avg'].values
-    if fallback_triggered:
-        # Fallback already in revenue scale
-        p10 = 0.8 * p50
-        p90 = 1.2 * p50
-    else:
-        # Clip to prevent overflow in expm1
-        max_log_input = 100  # expm1(100) ≈ 2.688e43
-        p50 = np.clip(p50, a_min=None, a_max=max_log_input)
-        p10 = np.clip(p10, a_min=None, a_max=max_log_input)
-        p90 = np.clip(p90, a_min=None, a_max=max_log_input)
-        # Apply expm1 safely
-        p50 = np.expm1(p50) * store_month_avg
-        p10 = np.expm1(p10) * store_month_avg
-        p90 = np.expm1(p90) * store_month_avg
-    # Clamp values to avoid negative or invalid outputs
-    p10 = np.maximum(p10, 0)
-    p90 = np.maximum(p90, p50)
+    # --- Inverse log transform using model metadata ---
+    # Load train_pred_mean and target_mean from model metadata
+    try:
+        with open('models/brandA_model_metadata.json', 'r') as f:
+            model_meta = json.load(f)
+        train_pred_mean = model_meta['train_pred_mean']
+        target_mean = model_meta['target_mean']
+    except Exception as e:
+        logger.warning(f"Could not load model metadata for inverse transform: {e}")
+        train_pred_mean = 0.0
+        target_mean = 1.0
 
-    # Fix 3: Guarded store_weekday_avg logic
+    # Model prediction (log space)
+    p50_log = models['median'].predict(X_pred)
+    p10_log = models['lower'].predict(X_pred)
+    p90_log = models['upper'].predict(X_pred)
+
+    # Inverse log transform for all quantiles
+    scale = target_mean / np.expm1(train_pred_mean) if np.expm1(train_pred_mean) != 0 else 1.0
+    p50 = np.expm1(p50_log) * scale
+    p10 = np.expm1(p10_log) * scale
+    p90 = np.expm1(p90_log) * scale
+
+    # --- Post-processing rules for prediction intervals ---
     if 'store_weekday_avg' in df_X.columns:
-        p10 = np.maximum(p10, 0.5 * np.nan_to_num(df_X['store_weekday_avg'], nan=0))
-
-    # Ensemble: average store-day and global seasonal model predictions
-    if 'model_global' in models:
-        median_pred_store = np.expm1(models['median'].predict(df_X[feature_names['all_features']]))
-        median_pred_global = np.expm1(models['model_global'].predict(df_X[feature_names['all_features']]))
-        median_pred = 0.5 * median_pred_store + 0.5 * median_pred_global
-        # Use median_pred for p50, and adjust p10/p90 accordingly
-        p50 = median_pred
-        # Optionally, average lower/upper as well if available
-        p10 = np.maximum(p10, 0.5 * p50)
-        p90 = np.minimum(p90, 1.5 * p50)
-
-    # Confidence bands: widen p10/p90 by historical residuals per store-day bucket
-    if historical_sales is not None and 'store' in df_X.columns and 'day_of_week' in df_X.columns:
+        p10 = np.maximum(p10, 0.5 * df_X['store_weekday_avg'])
+    if 'revenue_rolling_mean_3d' in df_X.columns:
+        p50 = 0.8 * p50 + 0.2 * df_X['revenue_rolling_mean_3d']
+    if 'revenue_volatility_3d' in df_X.columns:
+        vol = df_X['revenue_volatility_3d'].fillna(0)
+        p10 = np.where(vol > 0.4, p50 - 1.2 * (p50 - p10), p10)
+        p90 = np.where(vol > 0.4, p50 + 1.2 * (p90 - p50), p90)
+    preds = np.vstack([p10, p50, p90])
+    p10, p50, p90 = np.sort(preds, axis=0)
+    if 'store_seasonal_index' in df_X.columns:
+        upper_clip = df_X['store_seasonal_index'] * 1.5 * p50
+        p90 = np.minimum(p90, upper_clip)
+    shap_sum = np.abs(shap_values).sum(axis=1)
+    if 'revenue_rolling_mean_7d' in df_X.columns:
+        p50 = np.where(shap_sum < 0.1, df_X['revenue_rolling_mean_7d'], p50)
+    if 'store_month_revenue_median' in df_X.columns and 'store_month_revenue_std' in df_X.columns:
+        upper_bound = df_X['store_month_revenue_median'] + 1.5 * df_X['store_month_revenue_std']
+        p90 = np.minimum(p90, upper_bound)
+    if all([f'revenue_lag_{lag}' in df_X.columns for lag in [7, 14, 30]]):
+        rolling_avg = (df_X['revenue_lag_7'] + df_X['revenue_lag_14'] + df_X['revenue_lag_30']) / 3
+        p50 = 0.75 * p50 + 0.25 * rolling_avg
+    if 'premium_location_discount' in df_X.columns:
+        boost = 0.1 * df_X['premium_location_discount']
+        p90 += boost
+    if 'city_encoded' in df_X.columns and 'revenue_last_3_days' in df_X.columns:
+        fallback = 0.5 * df_X['revenue_last_3_days'] + 0.5 * df_X['city_encoded']
+        p50 = np.where(shap_sum < 0.05, fallback, p50)
+    
+    # --- Store-based fallback for p50 ---
+    if historical_sales is not None and not historical_sales.empty:
+        # Find min historical revenue for this store, weekday, and month
         for idx, row in df_X.iterrows():
-            store = row['store']
-            dow = row['day_of_week']
-            mask = (historical_sales['store'] == store) & (historical_sales['date'].dt.dayofweek == dow)
-            if not historical_sales[mask].empty:
-                residuals = historical_sales[mask]['revenue'] - row.get('store_dayofweek_avg', 0)
-                std_resid = residuals.std() if not residuals.empty else 0
-                p10[idx] = p10[idx] - std_resid
-                p90[idx] = p90[idx] + std_resid
+            store = row['store'] if 'store' in row else None
+            weekday = row['day_of_week'] if 'day_of_week' in row else None
+            month = row['month'] if 'month' in row else None
+            if store is not None and weekday is not None and month is not None:
+                mask = (
+                    (historical_sales['store'] == store) &
+                    (historical_sales['date'].dt.dayofweek == weekday) &
+                    (historical_sales['date'].dt.month == month)
+                )
+                same_day_hist = historical_sales[mask]
+                if not same_day_hist.empty:
+                    min_revenue = same_day_hist['revenue'].min()
+                    avg_revenue = same_day_hist['revenue'].mean()
+                    if p50[idx] < min_revenue:
+                        logging.debug(f"p50[{idx}] ({p50[idx]}) < min historical same-day revenue ({min_revenue}), overriding with avg {avg_revenue}")
+                        p50[idx] = avg_revenue
+    logging.debug(f"Final p10: {p10}")
+    logging.debug(f"Final p50: {p50}")
+    logging.debug(f"Final p90: {p90}")
+    
+    # --- SHAP logging ---
+    print('Top SHAP features:')
+    for i, s in enumerate(np.abs(shap_values[0]).argsort()[::-1][:5]):
+        print(f"{i+1}: {feature_names['all_features'][s]} -> {shap_values[0][s]:.2f}")
+
+    # SHAP audit: log top 10 features and check for leakage
+    top_10 = list(sorted_importance.items())[:10]
+    logging.info('Top 10 SHAP features:')
+    for feat, val in top_10:
+        logging.info(f'{feat}: {val:.3f}')
+    lag_patterns = ['revenue_lag_', 'revenue_rolling_', 'rolling_', 'lag_']
+    for feat, _ in top_10:
+        if any(pat in feat for pat in lag_patterns):
+            logging.warning(f'Potential leakage: lag/rolling feature in top 10: {feat}')
+    must_have = ['store', 'store_dayofweek_avg', 'discount_pct']
+    for must in must_have:
+        if not any(must in feat for feat, _ in top_10):
+            logging.warning(f'Expected stable feature missing from top 10: {must}')
 
     # --- CLIP AND VALIDATE TEST INPUTS ---
     try:

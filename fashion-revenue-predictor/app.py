@@ -503,12 +503,6 @@ elif page == "Predict":
                         f"₹{float(results['p50'][0]):,.2f}",
                         delta=None
                     )
-                with col2:
-                    st.metric(
-                        "Prediction Range",
-                        f"₹{float(results['p10'][0]):,.2f} - ₹{float(results['p90'][0]):,.2f}",
-                        delta=None
-                    )
                 
                 # Historical Comparison Section
                 st.markdown("### Historical Comparison")
@@ -518,8 +512,6 @@ elif page == "Predict":
                 col1, col2 = st.columns(2)
                 with col1:
                     st.metric("P50 Revenue", f"₹{float(results['p50'][0]):,.2f}")
-                with col2:
-                    st.metric("Prediction Range", f"₹{float(results['p10'][0]):,.2f} - ₹{float(results['p90'][0]):,.2f}")
                 
                 st.markdown("---")
                 
