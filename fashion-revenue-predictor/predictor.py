@@ -331,17 +331,19 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
             logger.warning(f"Could not apply log1p-inverse and scaling to rf_pred: {e}")
     fallback_triggered = False
     
-    if (np.isnan(rf_pred).any() or
+    if (rf_pred is None or np.isnan(rf_pred).any() or np.isinf(rf_pred).any() or 
         (input_nans > len(feature_names['all_features']) * 0.5) or  # More than 50% features are NaN
         (input_sum == 0) or (rf_pred[0] == 0)):
         logger.warning("Model output is invalid or input data is too sparse or zero. Triggering custom fallback.")
         p50 = np.array([custom_fallback_value])
         fallback_triggered = True
-    elif abs(rf_pred[0] - fallback_value) > fallback_value * 2:  # If prediction differs by more than 2x
-        p50 = np.array([0.7 * fallback_value + 0.3 * rf_pred[0]])  # Weighted average favoring fallback
-        logger.info("Using weighted average of model prediction and fallback value")
     else:
-        p50 = rf_pred
+        # If prediction is too low or high compared to fallback, use weighted average
+        if abs(rf_pred[0] - fallback_value) > fallback_value * 2:  # If prediction differs by more than 2x
+            p50 = np.array([0.7 * fallback_value + 0.3 * rf_pred[0]])  # Weighted average favoring fallback
+            logger.info("Using weighted average of model prediction and fallback value")
+        else:
+            p50 = rf_pred
     logger.debug(f"rf_pred: {rf_pred}, fallback_triggered: {fallback_triggered}")
     p10 = p50 * 0.5
     p90 = p50 * 1.5
