@@ -297,15 +297,15 @@ def train_model(df_sales, df_stores):
 
     # Instantiate Random Forest models for median, lower, and upper quantiles
     logging.info("Initializing Random Forest models with parameters:")
-    logging.info("- n_estimators: 100")
+    logging.info("- n_estimators: 50")
     logging.info("- max_depth: 8")
     logging.info("- min_samples_split: 5")
     logging.info("- min_samples_leaf: 2")
     logging.info("- n_jobs: -1 (using all available cores)")
     
-    rf_median = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
-    rf_lower = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
-    rf_upper = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
+    rf_median = RandomForestRegressor(n_estimators=50, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
+    rf_lower = RandomForestRegressor(n_estimators=50, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
+    rf_upper = RandomForestRegressor(n_estimators=50, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
 
     # Select features (skip SHAP and pruning for simplicity)
     selected_features = X.columns.tolist()
@@ -322,13 +322,100 @@ def train_model(df_sales, df_stores):
     perm_result = permutation_importance(rf_median, X_selected, y_log, n_repeats=5, random_state=42, n_jobs=-1)
     importances = perm_result.importances_mean
     keep_mask = importances > 0.001
+    
+    # Add detailed logging about permutation importance results
+    logging.info("Permutation importance calculation completed")
+    logging.info(f"Total features before filtering: {len(importances)}")
+    logging.info(f"Features kept after importance threshold: {keep_mask.sum()}")
+    logging.info(f"Features dropped: {len(importances) - keep_mask.sum()}")
+    
+    # Log importance statistics
+    logging.info("Permutation importance statistics:")
+    logging.info(f"- Mean importance: {np.mean(importances):.6f}")
+    logging.info(f"- Median importance: {np.median(importances):.6f}")
+    logging.info(f"- Max importance: {np.max(importances):.6f}")
+    logging.info(f"- Min importance: {np.min(importances):.6f}")
+    
+    # Log importance distribution
+    percentiles = [0, 25, 50, 75, 90, 95, 99, 100]
+    logging.info("Permutation importance percentiles:")
+    for p in percentiles:
+        logging.info(f"- {p}th percentile: {np.percentile(importances, p):.6f}")
+    
+    # Log features being kept and dropped
+    kept_features = X_selected.columns[keep_mask].tolist()
+    dropped_features = X_selected.columns[~keep_mask].tolist()
+    
+    logging.info("Top 10 most important features being kept:")
+    sorted_importances = sorted(zip(X_selected.columns, importances), key=lambda x: x[1], reverse=True)
+    for feat, imp in sorted_importances[:10]:
+        if feat in kept_features:
+            logging.info(f"- {feat}: {imp:.6f}")
+    
+    logging.info("Features being dropped (importance < 0.001):")
+    for feat in dropped_features:
+        feat_imp = importances[X_selected.columns.get_loc(feat)]
+        logging.info(f"- {feat}: {feat_imp:.6f}")
+    
+    # Apply the feature selection
     X_selected = X_selected.loc[:, keep_mask]
     selected_features = X_selected.columns.tolist()
-    logging.info(f"Features after permutation importance filter: {len(selected_features)} features")
-    logging.info("Top 10 most important features by permutation importance:")
-    for feat, imp in sorted(zip(X_selected.columns, importances[keep_mask]), key=lambda x: x[1], reverse=True)[:10]:
-        logging.info(f"- {feat}: {imp:.6f}")
-
+    
+    # Log feature correlation analysis
+    logging.info("Analyzing feature correlations after selection...")
+    corr_matrix = X_selected.corr().abs()
+    high_corr_pairs = []
+    for i in range(len(corr_matrix.columns)):
+        for j in range(i+1, len(corr_matrix.columns)):
+            if corr_matrix.iloc[i,j] > 0.8:  # High correlation threshold
+                high_corr_pairs.append((
+                    corr_matrix.columns[i],
+                    corr_matrix.columns[j],
+                    corr_matrix.iloc[i,j]
+                ))
+    
+    if high_corr_pairs:
+        logging.info("Found highly correlated feature pairs (correlation > 0.8):")
+        for feat1, feat2, corr in sorted(high_corr_pairs, key=lambda x: x[2], reverse=True):
+            logging.info(f"- {feat1} & {feat2}: {corr:.3f}")
+    else:
+        logging.info("No highly correlated feature pairs found")
+    
+    # Log feature statistics after selection
+    logging.info("Feature statistics after selection:")
+    for col in X_selected.columns:
+        try:
+            # Check if column is numeric
+            if pd.api.types.is_numeric_dtype(X_selected[col]):
+        col_stats = X_selected[col].describe()
+        logging.info(f"\nStatistics for {col}:")
+                if 'mean' in col_stats:
+        logging.info(f"- Mean: {col_stats['mean']:.6f}")
+                if 'std' in col_stats:
+        logging.info(f"- Std: {col_stats['std']:.6f}")
+                if 'min' in col_stats:
+        logging.info(f"- Min: {col_stats['min']:.6f}")
+                if 'max' in col_stats:
+        logging.info(f"- Max: {col_stats['max']:.6f}")
+        logging.info(f"- Non-zero count: {(X_selected[col] != 0).sum()}")
+        logging.info(f"- Zero count: {(X_selected[col] == 0).sum()}")
+            else:
+                logging.info(f"\nStatistics for {col} (non-numeric):")
+                logging.info(f"- Unique values: {X_selected[col].nunique()}")
+                logging.info(f"- Most common value: {X_selected[col].mode().iloc[0] if not X_selected[col].empty else 'N/A'}")
+        except Exception as e:
+            logging.warning(f"Could not calculate statistics for column {col}: {str(e)}")
+    
+    # Log memory usage of selected features
+    memory_usage = X_selected.memory_usage(deep=True).sum() / 1024 / 1024  # Convert to MB
+    logging.info(f"Memory usage of selected features: {memory_usage:.2f} MB")
+    
+    # Log feature types
+    dtypes = X_selected.dtypes.value_counts()
+    logging.info("Feature data types after selection:")
+    for dtype, count in dtypes.items():
+        logging.info(f"- {dtype}: {count} features")
+    
     # --- Drop low-importance features, but always keep key business features
     key_features = ['revenue_lag_7', 'revenue_rolling_mean_7d', 'discount_pct', 'weekday_store_avg']
     logging.info(f"Ensuring key business features are kept: {key_features}")
@@ -400,15 +487,15 @@ def train_model(df_sales, df_stores):
 
     # --- Regularize Random Forest ---
     logging.info("Initializing final Random Forest models with regularized parameters:")
-    logging.info("- n_estimators: 100")
+    logging.info("- n_estimators: 50")
     logging.info("- max_depth: 12")
     logging.info("- min_samples_split: 5")
     logging.info("- min_samples_leaf: 30")
     logging.info("- max_features: 0.3")
     
-    rf_median = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
-    rf_lower = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
-    rf_upper = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
+    rf_median = RandomForestRegressor(n_estimators=50, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
+    rf_lower = RandomForestRegressor(n_estimators=50, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
+    rf_upper = RandomForestRegressor(n_estimators=50, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
 
     # --- Never allow NaN in X_selected before fitting ---
     logging.info("Cleaning final feature set for training...")
