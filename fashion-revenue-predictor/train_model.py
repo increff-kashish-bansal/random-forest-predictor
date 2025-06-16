@@ -168,17 +168,22 @@ def train_model(df_sales, df_stores):
     if 'revenue' not in df_sales.columns:
         raise ValueError("Missing 'revenue' column in sales data")
     
+    logging.info("Calculating store-day-of-week averages...")
     # Calculate store_dayofweek_avg for each row (move this up)
     df_sales['day_of_week'] = pd.to_datetime(df_sales['date']).dt.dayofweek
     store_dayofweek_avg = df_sales.groupby(['store', 'day_of_week'])['revenue'].transform('mean')
     df_sales['store_dayofweek_avg'] = store_dayofweek_avg
 
+    logging.info("Handling outliers and low-activity days...")
     # Outlier handling: clip revenue to 95th percentile per store-month
     df_sales['month'] = pd.to_datetime(df_sales['date']).dt.month
     revenue_95 = df_sales.groupby(['store', 'month'])['revenue'].transform(lambda x: x.quantile(0.95))
     df_sales['revenue'] = np.minimum(df_sales['revenue'], revenue_95)
     # Remove low-activity days
+    initial_rows = len(df_sales)
     df_sales = df_sales[df_sales['store_dayofweek_avg'] >= 100]
+    removed_rows = initial_rows - len(df_sales)
+    logging.info(f"Removed {removed_rows} low-activity days (revenue < 100)")
     
     # Analyze revenue distribution
     logging.info("\nRevenue Distribution Analysis:")
@@ -198,9 +203,7 @@ def train_model(df_sales, df_stores):
     if missing_revenue > 0:
         logging.warning(f"Found {missing_revenue} missing values in revenue column")
         # Fill missing values with median revenue for that store
-        df_sales['revenue'] = df_sales.groupby('store')['revenue'].transform(
-            lambda x: x.fillna(x.median())
-        )
+        df_sales['revenue'] = df_sales.groupby('store')['revenue'].transform(lambda x: x.fillna(x.median()))
         logging.info("Filled missing revenue values with store-specific medians")
     
     # Check for zeros and extreme outliers
