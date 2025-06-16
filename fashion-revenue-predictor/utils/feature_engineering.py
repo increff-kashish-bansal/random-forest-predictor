@@ -305,6 +305,8 @@ def derive_features(df_sales: pd.DataFrame, df_stores: pd.DataFrame, historical_
     # Calculate sample weights if not in prediction mode
     if not is_prediction and 'revenue' in df_sales.columns:
         sample_weights = calculate_sample_weights(df_sales)
+        # Ensure the 'models' directory exists before saving
+        os.makedirs('models', exist_ok=True)
         # Save weights for later use in model training
         np.save('models/sample_weights.npy', sample_weights)
         logging.info("Sample weights calculated and saved")
