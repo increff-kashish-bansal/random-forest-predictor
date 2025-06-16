@@ -259,8 +259,8 @@ def train_model(df_sales, df_stores):
     
     logging.info("\nStarting feature engineering...")
     # Feature engineering
-    df_features = derive_features(df_sales, df_stores)
-    logging.info(f"Generated {df_features.shape[1]} features")
+    df_features, feature_list = derive_features(df_sales, df_stores)
+    logging.info(f"Generated {len(feature_list)} features")
     
     # Log feature types and missing values
     feature_types = df_features.dtypes.value_counts()
@@ -404,9 +404,9 @@ def train_model(df_sales, df_stores):
     
     joblib.dump(model, model_path / 'model.joblib')
     with open(model_path / 'feature_names.json', 'w') as f:
-        json.dump(list(X.columns), f)
+        json.dump(feature_list, f)
     
     logging.info("="*50)
     logging.info("Model training and saving completed successfully")
     logging.info("="*50)
-    return model, X.columns
+    return model, feature_list
