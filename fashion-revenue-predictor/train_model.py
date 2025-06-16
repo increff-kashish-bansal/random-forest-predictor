@@ -259,6 +259,36 @@ def train_model(df_sales, df_stores):
     # Calculate sample weights
     sample_weights = calculate_sample_weights(df_sales.iloc[sort_idx])
     logging.info("Sample weights calculated with log-based decay and day-of-week weighting")
+    
+    # Add detailed logging about sample weights
+    logging.info(f"Sample weights statistics:")
+    logging.info(f"- Min weight: {np.min(sample_weights):.6f}")
+    logging.info(f"- Max weight: {np.max(sample_weights):.6f}")
+    logging.info(f"- Mean weight: {np.mean(sample_weights):.6f}")
+    logging.info(f"- Median weight: {np.median(sample_weights):.6f}")
+    logging.info(f"- Weight distribution percentiles:")
+    percentiles = [0, 10, 25, 50, 75, 90, 100]
+    for p in percentiles:
+        logging.info(f"  {p}th percentile: {np.percentile(sample_weights, p):.6f}")
+    
+    # Log weight distribution by day of week
+    dow_weights = pd.DataFrame({
+        'day_of_week': df_sales.iloc[sort_idx]['date'].dt.dayofweek,
+        'weight': sample_weights
+    }).groupby('day_of_week')['weight'].agg(['mean', 'std', 'count'])
+    logging.info("Sample weights by day of week:")
+    for dow, row in dow_weights.iterrows():
+        logging.info(f"- Day {dow}: mean={row['mean']:.6f}, std={row['std']:.6f}, count={row['count']}")
+    
+    # Log weight distribution by month
+    month_weights = pd.DataFrame({
+        'month': df_sales.iloc[sort_idx]['date'].dt.month,
+        'weight': sample_weights
+    }).groupby('month')['weight'].agg(['mean', 'std', 'count'])
+    logging.info("Sample weights by month:")
+    for month, row in month_weights.iterrows():
+        logging.info(f"- Month {month}: mean={row['mean']:.6f}, std={row['std']:.6f}, count={row['count']}")
+    
     # --- Recent data boost ---
     cutoff_date = df_sales['date'].max() - pd.Timedelta(days=90)
     recent_mask = (df_sales.iloc[sort_idx]['date'] > cutoff_date)
@@ -266,6 +296,13 @@ def train_model(df_sales, df_stores):
     sample_weights = sample_weights / sample_weights.sum()  # Renormalize
 
     # Instantiate Random Forest models for median, lower, and upper quantiles
+    logging.info("Initializing Random Forest models with parameters:")
+    logging.info("- n_estimators: 100")
+    logging.info("- max_depth: 8")
+    logging.info("- min_samples_split: 5")
+    logging.info("- min_samples_leaf: 2")
+    logging.info("- n_jobs: -1 (using all available cores)")
+    
     rf_median = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
     rf_lower = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
     rf_upper = RandomForestRegressor(n_estimators=100, max_depth=8, min_samples_split=5, min_samples_leaf=2, random_state=42, n_jobs=-1)
@@ -273,21 +310,30 @@ def train_model(df_sales, df_stores):
     # Select features (skip SHAP and pruning for simplicity)
     selected_features = X.columns.tolist()
     X_selected = X[selected_features]
+    logging.info(f"Initial feature set size: {len(selected_features)} features")
 
     # Fit rf_median before feature selection (log target)
+    logging.info("Training initial median model for feature selection...")
     rf_median.fit(X_selected, y_log, sample_weight=sample_weights)
+    logging.info("Initial median model training completed")
 
     # --- Permutation importance filter ---
+    logging.info("Calculating permutation importance for feature selection...")
     perm_result = permutation_importance(rf_median, X_selected, y_log, n_repeats=5, random_state=42, n_jobs=-1)
     importances = perm_result.importances_mean
     keep_mask = importances > 0.001
     X_selected = X_selected.loc[:, keep_mask]
     selected_features = X_selected.columns.tolist()
-    logging.info(f"Features kept after permutation importance: {selected_features}")
+    logging.info(f"Features after permutation importance filter: {len(selected_features)} features")
+    logging.info("Top 10 most important features by permutation importance:")
+    for feat, imp in sorted(zip(X_selected.columns, importances[keep_mask]), key=lambda x: x[1], reverse=True)[:10]:
+        logging.info(f"- {feat}: {imp:.6f}")
 
     # --- Drop low-importance features, but always keep key business features
     key_features = ['revenue_lag_7', 'revenue_rolling_mean_7d', 'discount_pct', 'weekday_store_avg']
+    logging.info(f"Ensuring key business features are kept: {key_features}")
     X_selected, selected_features = drop_low_importance_features(rf_median, X_selected, threshold=0.001, keep_features=key_features)
+    logging.info(f"Features after dropping low-importance features: {len(selected_features)} features")
 
     # --- (3) Ensure volatility features are included in lower/upper model features ---
     volatility_features = [
@@ -295,12 +341,16 @@ def train_model(df_sales, df_stores):
         'revenue_week_over_week',
         'revenue_day_over_day'
     ]
+    logging.info("Adding volatility features to feature set...")
     for feat in volatility_features:
         if feat not in X_selected.columns and feat in X.columns:
             X_selected[feat] = X[feat]
+            logging.info(f"Added volatility feature: {feat}")
         if feat not in selected_features:
             selected_features.append(feat)
+
     # --- Drop low-importance features after SHAP ---
+    logging.info("Calculating SHAP values for feature importance...")
     try:
         X_selected = X_selected.astype(float)
         X_selected = X_selected.replace([np.inf, -np.inf], np.nan).fillna(0)
@@ -311,53 +361,73 @@ def train_model(df_sales, df_stores):
         top_10 = [f for f in sorted_importance if f[0] != 'revenue_percentile'][:10]
         logging.info('Top 10 SHAP features after removing revenue_percentile:')
         for feat, val in top_10:
-            logging.info(f'{feat}: {val:.3f}')
+            logging.info(f'- {feat}: {val:.6f}')
+        
         # Drop low-importance features
         if sorted_importance:
             max_importance = max([v for _, v in sorted_importance])
             low_shap_features = [f for f, v in sorted_importance if v < 0.01 * max_importance]
             if low_shap_features:
-                logging.info(f"Dropped low-SHAP features: {low_shap_features}")
+                logging.info(f"Dropping {len(low_shap_features)} low-SHAP features")
+                logging.info(f"Low-SHAP features to be dropped: {low_shap_features}")
             actually_dropped = [col for col in low_shap_features if col in X_selected.columns]
             if actually_dropped:
-                logging.info(f"Dropped low-SHAP features: {actually_dropped}")
-            X_selected = X_selected.drop(columns=low_shap_features, errors='ignore')
+                logging.info(f"Successfully dropped {len(actually_dropped)} features")
+                X_selected = X_selected.drop(columns=low_shap_features, errors='ignore')
     except Exception as e:
-        logging.warning(f"SHAP feature importance logging or feature dropping skipped due to error: {e}")
-    # --- Always add back stable anchors (never drop, even if sparse/low-SHAP) ---
+        logging.warning(f"SHAP feature importance calculation failed: {str(e)}")
+
+    # --- Always add back stable anchors ---
     stable_anchors = [
         'revenue_lag_7', 'revenue_rolling_mean_7d', 'discount_pct', 'store_month_avg', 'weekday_store_ord',
         'year', 'day_of_week', 'quarter', 'is_weekend', 'day_of_week_sin', 'day_of_week_cos', 'month_sin', 'month_cos'
     ]
+    logging.info("Adding back stable anchor features...")
     for anchor in stable_anchors:
         if anchor not in X_selected.columns and anchor in X.columns:
             X_selected[anchor] = X[anchor]
+            logging.info(f"Added stable anchor: {anchor}")
         if anchor not in selected_features:
             selected_features.append(anchor)
+
     # --- Final robust feature alignment for training ---
-    # Only save and use columns actually present in X_selected
     final_features = X_selected.columns.tolist()
+    logging.info(f"Final feature set size: {len(final_features)} features")
+    logging.info("Saving feature names to models/brandA_feature_names.json")
     import json
     with open('models/brandA_feature_names.json', 'w') as f:
         json.dump({'all_features': final_features}, f)
-    # Fit model on exactly these columns
-    X_selected = X_selected[final_features]
 
     # --- Regularize Random Forest ---
+    logging.info("Initializing final Random Forest models with regularized parameters:")
+    logging.info("- n_estimators: 100")
+    logging.info("- max_depth: 12")
+    logging.info("- min_samples_split: 5")
+    logging.info("- min_samples_leaf: 30")
+    logging.info("- max_features: 0.3")
+    
     rf_median = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
     rf_lower = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
     rf_upper = RandomForestRegressor(n_estimators=100, max_depth=12, min_samples_split=5, min_samples_leaf=30, max_features=0.3, random_state=42, n_jobs=-1)
 
     # --- Never allow NaN in X_selected before fitting ---
+    logging.info("Cleaning final feature set for training...")
     X_selected = X_selected.replace([np.inf, -np.inf], np.nan).fillna(0)
+    logging.info("Feature set cleaned and ready for training")
 
     # Re-split after feature selection
+    logging.info("Splitting data into train/test sets (80/20 split)...")
     X_train, X_test, y_train, y_test = train_test_split(
         X_selected, y_log, test_size=0.2, random_state=42
     )
+    logging.info(f"Training set size: {len(X_train)} samples")
+    logging.info(f"Test set size: {len(X_test)} samples")
 
     # Retrain models on reduced feature set (log target)
+    logging.info("Training final median model...")
     rf_median.fit(X_train, y_train, sample_weight=sample_weights[:len(X_train)])
+    logging.info("Median model training completed")
+    
     median_pred_train = rf_median.predict(X_train)
     median_pred_test = rf_median.predict(X_test)
     residuals_train = y_train - median_pred_train
@@ -366,47 +436,52 @@ def train_model(df_sales, df_stores):
     # --- Save model metadata for correct scaling ---
     train_pred_mean = float(np.mean(median_pred_train))
     target_mean = float(np.mean(np.expm1(y_train)))
+    logging.info(f"Model metadata - Train prediction mean: {train_pred_mean:.6f}")
+    logging.info(f"Model metadata - Target mean: {target_mean:.6f}")
+    
     with open('models/brandA_model_metadata.json', 'w') as f:
         json.dump({'train_pred_mean': train_pred_mean, 'target_mean': target_mean}, f)
     logging.info("Saved model metadata to models/brandA_model_metadata.json")
 
     # --- (4) Smooth residuals using rolling median (window=7) ---
+    logging.info("Smoothing residuals using rolling median (window=7)...")
     def smooth_residuals(residuals, window=7):
         return pd.Series(residuals).rolling(window=window, min_periods=1, center=True).median().values
 
     smoothed_abs_residuals_train = smooth_residuals(np.abs(residuals_train))
     smoothed_abs_residuals_test = smooth_residuals(np.abs(residuals_test))
+    logging.info("Residual smoothing completed")
 
     # --- (1) Redefine lower/upper model targets as smoothed abs residuals ---
     lower_targets_train = smoothed_abs_residuals_train
     upper_targets_train = smoothed_abs_residuals_train
 
     # Fit lower/upper models
+    logging.info("Training lower bound model...")
     rf_lower.fit(X_train, lower_targets_train)
+    logging.info("Lower bound model training completed")
+    
     lower_pred_train = rf_lower.predict(X_train)
     lower_pred_test = rf_lower.predict(X_test)
 
+    logging.info("Training upper bound model...")
     rf_upper.fit(X_train, upper_targets_train)
+    logging.info("Upper bound model training completed")
+    
     upper_pred_train = rf_upper.predict(X_train)
     upper_pred_test = rf_upper.predict(X_test)
 
     # --- (2) Log and penalize coverage misses during tail model training ---
-    # Compute prediction intervals
+    logging.info("Calculating prediction intervals and coverage metrics...")
     p10_train = median_pred_train - lower_pred_train
     p90_train = median_pred_train + upper_pred_train
     coverage_misses = (y_train < p10_train) | (y_train > p90_train)
-    # Align mask index with sample_weights_tail
     coverage_misses = pd.Series(coverage_misses, index=y_train.index)
     coverage_miss_rate = np.mean(coverage_misses)
-    logging.info(f"Coverage miss rate during training: {coverage_miss_rate:.2%} ({coverage_misses.sum()} / {len(y_train)})")
-    # Optionally, increase sample weights for misses (simple boost)
-    sample_weights_tail = sample_weights.copy()
-    sample_weights_tail = pd.Series(sample_weights_tail, index=y_train.index)
-    sample_weights_tail.loc[coverage_misses] *= 2  # Double weight for misses
-    sample_weights_tail = sample_weights_tail.values  # Convert back to np.ndarray if needed
-    # Optionally refit lower/upper with boosted weights (uncomment if desired):
-    # rf_lower.fit(X_train, lower_targets_train, sample_weight=sample_weights_tail)
-    # rf_upper.fit(X_train, upper_targets_train, sample_weight=sample_weights_tail)
+    logging.info(f"Training set coverage metrics:")
+    logging.info(f"- Coverage miss rate: {coverage_miss_rate:.2%}")
+    logging.info(f"- Number of misses: {coverage_misses.sum()}")
+    logging.info(f"- Total samples: {len(y_train)}")
 
     # Compute R² scores
     train_scores = {
@@ -420,6 +495,14 @@ def train_model(df_sales, df_stores):
         'upper': r2_score(smoothed_abs_residuals_test, upper_pred_test)
     }
 
+    logging.info("Model performance metrics:")
+    logging.info("Training set R² scores:")
+    for model, score in train_scores.items():
+        logging.info(f"- {model}: {score:.6f}")
+    logging.info("Test set R² scores:")
+    for model, score in test_scores.items():
+        logging.info(f"- {model}: {score:.6f}")
+
     # Compute test set prediction intervals for metrics
     p10_test = median_pred_test - lower_pred_test
     p50_test = median_pred_test
@@ -427,12 +510,19 @@ def train_model(df_sales, df_stores):
 
     # Calculate prediction interval metrics
     prediction_metrics = calculate_prediction_metrics(y_test, p10_test, p50_test, p90_test)
+    logging.info("Prediction interval metrics:")
+    logging.info(f"- Coverage: {prediction_metrics['coverage']:.2%}")
+    logging.info(f"- Sharpness: {prediction_metrics['sharpness']:.2f}")
+    logging.info(f"- RMSE: {prediction_metrics['rmse']:.2f}")
+    logging.info(f"- MAE: {prediction_metrics['mae']:.2f}")
     
     # Save models
+    logging.info("Saving trained models...")
     joblib.dump({'median': rf_median, 'lower': rf_lower, 'upper': rf_upper}, 'models/brandA_model.pkl')
-    logging.info("Saved Random Forest models to models/brandA_model.pkl")
+    logging.info("Models saved successfully to models/brandA_model.pkl")
 
     # Save feature percentiles for robust prediction-time clipping
+    logging.info("Calculating and saving feature percentiles...")
     percentiles = {}
     for col in X_selected.columns:
         percentiles[col] = {
@@ -441,19 +531,19 @@ def train_model(df_sales, df_stores):
         }
     with open('models/brandA_feature_percentiles.json', 'w') as f:
         json.dump(percentiles, f)
-    logging.info("Saved feature percentiles to models/brandA_feature_percentiles.json")
+    logging.info("Feature percentiles saved to models/brandA_feature_percentiles.json")
 
     # Get feature importances from the median model
+    logging.info("Calculating final feature importances...")
     importances = rf_median.feature_importances_
     feature_importances = dict(zip(selected_features, importances))
+    
+    # Log top 20 most important features
+    logging.info("Top 20 most important features:")
+    for feat, imp in sorted(feature_importances.items(), key=lambda x: x[1], reverse=True)[:20]:
+        logging.info(f"- {feat}: {imp:.6f}")
 
-    # Permutation importance on test set
-    perm_result = permutation_importance(rf_median, X_test, y_test, n_repeats=5, random_state=42, n_jobs=-1)
-    perm_sorted_idx = perm_result.importances_mean.argsort()[::-1]
-    top_20_perm = [(X_test.columns[i], perm_result.importances_mean[i]) for i in perm_sorted_idx[:20]]
-    logging.info('Top 20 permutation importance features:')
-    for feat, score in top_20_perm:
-        logging.info(f'{feat}: {score:.4f}')
+    logging.info("Model training and saving completed successfully")
     
     os.makedirs('models', exist_ok=True)
     
