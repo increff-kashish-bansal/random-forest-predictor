@@ -261,25 +261,23 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
                 (historical_sales['date'].dt.dayofweek == day_of_week)
             )
             store_hist = historical_sales[mask]
+            if not store_hist.empty:
+                # Use the most recent year's average as base
+                latest_year = store_hist['date'].dt.year.max()
+                latest_year_avg = store_hist[store_hist['date'].dt.year == latest_year]['revenue'].mean()
+                # Calculate year-over-year growth
+                yearly_avg = store_hist.groupby(store_hist['date'].dt.year)['revenue'].mean()
+                if len(yearly_avg) > 1:
+                    growth_rates = yearly_avg.pct_change().dropna()
+                    avg_growth_rate = growth_rates.mean()
+                    # Apply growth rate to latest year's average
+                    avg_revenue = latest_year_avg * (1 + avg_growth_rate)
+                else:
+                    avg_revenue = latest_year_avg
+            else:
+                avg_revenue = historical_sales['revenue'].mean()
         else:
-            store_hist = historical_sales
-        # Average revenue for same store, month, and day_of_week across all years
-        avg_revenue = store_hist['revenue'].mean() if store_hist is not None and not store_hist.empty else 0
-        # Get predicted date
-        if 'date' in df_X.columns:
-            pred_date = pd.to_datetime(df_X['date'].values[0])
-        elif original_input is not None and 'date' in original_input.columns:
-            pred_date = pd.to_datetime(original_input['date'].values[0])
-        else:
-            pred_date = None
-        # Get last available date in historical data
-        last_hist_date = store_hist['date'].max() if store_hist is not None and not store_hist.empty else None
-        # Number of years between predicted date and last available data date
-        if pred_date is not None and last_hist_date is not None:
-            years_diff = (pred_date.year - last_hist_date.year)
-            years_factor = years_diff / 100 + 1.1
-        else:
-            years_factor = 1.1
+            avg_revenue = historical_sales['revenue'].mean() if historical_sales is not None else 0
         # Get discount percentage
         if 'discount_pct' in df_X.columns:
             discount_perc = df_X['discount_pct'].values[0] * 100
@@ -289,8 +287,8 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
             discount_perc = 0
         discount_factor = (100 + discount_perc) / 100
         # Calculate fallback
-        fallback = avg_revenue * 1.1 * years_factor * discount_factor
-        logger.info(f"[CustomFallback] avg_revenue={avg_revenue}, years_factor={years_factor}, discount_factor={discount_factor}, fallback={fallback}")
+        fallback = avg_revenue * discount_factor
+        logger.info(f"[CustomFallback] avg_revenue={avg_revenue}, discount_factor={discount_factor}, fallback={fallback}")
         return fallback
 
     # --- Enhanced prediction fallback logic ---
@@ -305,7 +303,34 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
     # Use the larger of the two averages as fallback
     fallback_value = max(store_dayofweek_avg, store_month_avg_val)
     if fallback_value == 0 and historical_sales is not None:
-        fallback_value = historical_sales['revenue'].mean()
+        # Calculate fallback based on historical data for the same store, month, and day of week
+        store = df_X['store'].values[0] if 'store' in df_X.columns else None
+        month = df_X['month'].values[0] if 'month' in df_X.columns else None
+        day_of_week = df_X['day_of_week'].values[0] if 'day_of_week' in df_X.columns else None
+        if store is not None and month is not None and day_of_week is not None:
+            mask = (
+                (historical_sales['store'] == store) &
+                (historical_sales['date'].dt.month == month) &
+                (historical_sales['date'].dt.dayofweek == day_of_week)
+            )
+            store_hist = historical_sales[mask]
+            if not store_hist.empty:
+                # Use the most recent year's average as base
+                latest_year = store_hist['date'].dt.year.max()
+                latest_year_avg = store_hist[store_hist['date'].dt.year == latest_year]['revenue'].mean()
+                # Calculate year-over-year growth
+                yearly_avg = store_hist.groupby(store_hist['date'].dt.year)['revenue'].mean()
+                if len(yearly_avg) > 1:
+                    growth_rates = yearly_avg.pct_change().dropna()
+                    avg_growth_rate = growth_rates.mean()
+                    # Apply growth rate to latest year's average
+                    fallback_value = latest_year_avg * (1 + avg_growth_rate)
+                else:
+                    fallback_value = latest_year_avg
+            else:
+                fallback_value = historical_sales['revenue'].mean()
+        else:
+            fallback_value = historical_sales['revenue'].mean()
     
     # Use custom fallback if model output is invalid or zero
     custom_fallback_value = calculate_custom_fallback(df_X, historical_sales, original_input)
@@ -678,6 +703,11 @@ def predict_and_explain(df_X: pd.DataFrame, historical_sales: pd.DataFrame = Non
         logging.info(f"Top SHAP features for prediction {i}: {top_shap}")
         if interval_width[i] > 3 * p50[i]:
             warnings.warn(f"Prediction interval too wide for prediction {i}: width={interval_width[i]:.2f}, p50={p50[i]:.2f}")
+
+    # --- Enforce custom fallback as minimum for all quantiles ---
+    p10 = np.maximum(p10, custom_fallback_value)
+    p50 = np.maximum(p50, custom_fallback_value)
+    p90 = np.maximum(p90, custom_fallback_value)
 
     return {
         'p10': p10,
